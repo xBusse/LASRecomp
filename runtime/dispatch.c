@@ -7,6 +7,7 @@
 
 #include "gamelib.h"
 #include "hle.h"
+#include "interp.h"
 
 typedef struct { const uint64_t *addrs; const GuestFn *fns; uint64_t count, lo, hi; } FnTable;
 static FnTable tables[2];
@@ -62,6 +63,14 @@ void hle_override(uint64_t addr, HostFn fn, const char *name) {
     overrides[override_count].fn = fn;
     overrides[override_count].name = name;
     override_count++;
+    if (interp_active()) interp_invalidate(addr);  // (an instruction already decoded there)
+}
+
+// The replacement of the guest function at addr, if any (the interpreter decodes it into a call of it).
+HostFn dispatch_override_lookup(uint64_t addr) {
+    for (int i = 0; i < override_count; i++)
+        if (overrides[i].addr == addr) return overrides[i].fn;
+    return NULL;
 }
 
 static __thread uint64_t unimpl_pc;
@@ -107,6 +116,10 @@ void *hle_alloc(uint64_t size) {
 
 void dispatch_init(void) {  // (after gamelib_load)
     const GameLibTables *g = gamelib_tables();
+    if (!g) {  // no game code library: the interpreter runs the guest code (runtime/interp.c)
+        tables[0] = tables[1] = (FnTable){NULL, NULL, 0, 1, 0};
+        return;
+    }
     uint64_t nm = *g->main_count, ns = *g->sdk_count;
     tables[0] = (FnTable){g->main_addrs, g->main_fns, nm, g->main_addrs[0], g->main_addrs[nm - 1]};
     tables[1] = (FnTable){g->sdk_addrs, g->sdk_fns, ns, g->sdk_addrs[0], g->sdk_addrs[ns - 1]};
@@ -145,6 +158,7 @@ static GuestFn dispatch_slow(Cpu *c) {
     for (int i = 0; i < override_count; i++)
         if (overrides[i].addr == pc) return overrides[i].fn;
     GuestFn f = dispatch_lookup(pc);
+    if (!f && interp_active()) f = interp_enter;
     if (!f) {
         uint64_t off;
         const char *s = loader_symbol_at(c->x[30], &off);

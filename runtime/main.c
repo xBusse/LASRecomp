@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "gamelib.h"
+#include "interp.h"
 #include "paths.h"
 #include "settings.h"
 #include "hle.h"
@@ -141,9 +142,23 @@ static void boot(const char *root) {
     if (!g_romfs_dir) g_romfs_dir = strdup(romfs);
 
     char why[512];
-    if (!gamelib_load(root, why, sizeof why)) FATAL("%s\n", why);
+    // The game code: the library built from the game files, or - where none can be built or loaded (iOS), or with
+    // LARECOMP_INTERP=1 - the interpreter (runtime/interp.c), which runs the game's own code directly.
+    bool use_interp = getenv("LARECOMP_INTERP") && *getenv("LARECOMP_INTERP") == '1';
+    if (!use_interp && !gamelib_load(root, why, sizeof why)) {
+#if LAS_IOS
+        use_interp = true;
+#else
+        FATAL("%s\n", why);
+#endif
+    }
     loader_load(exefs);
     rando_boot();  // the chosen seed's data patches go into the freshly loaded module
+    if (use_interp) {
+        interp_init();
+        interp_reset_rando();
+        LOG("[interp] running the game code in the interpreter\n");
+    }
     { extern void settings_load(void); settings_load(); }
     kernel_init();
     dispatch_init();

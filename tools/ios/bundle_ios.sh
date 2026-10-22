@@ -44,7 +44,7 @@ if [ -f "$OUT/lasgame.dylib" ]; then
     echo "game code: included ($(du -h "$OUT/lasgame.dylib" | cut -f1)), id $(cat "$OUT/lasgame.dylib.id" 2>/dev/null || echo '?')"
 else
     rmdir "$APP/Frameworks"
-    echo "note: no $OUT/lasgame.dylib, so this app has no game code (make ios-gen first, with your game files in extracted/)"
+    echo "note: no $OUT/lasgame.dylib: the app runs the game code in its interpreter (make ios-gen first for compiled code)"
 fi
 
 # entitlements ride in an ad-hoc signature (every Mach-O, the library first)

@@ -184,7 +184,9 @@ static std::string check_copied_files(const std::string &root) {
 // "" = ready to play, else what is wrong
 static std::string check_game_files(const std::string &root) {
     std::string why = check_copied_files(root);
+#if !LAS_IOS  // (iOS runs the game's code in the interpreter: nothing to build)
     if (why.empty() && !gamelib_present(root.c_str())) return "Game code not built yet";
+#endif
     return why;
 }
 
@@ -282,12 +284,11 @@ static float extract_progress(void) {
 // Builds the game code from the copied files (a few minutes); false = failed (the job line says so)
 static bool build_game_code(void) {
 #if LAS_IOS
-    // An iOS app can't run a compiler or load code it just made: the game code is built on a Mac from the same files
-    // (make ios-gen, docs/ios.md) and travels inside the app. Here it is only checked for.
-    if (gamelib_present(g_root.c_str())) return true;
-    set_job("This copy of LAS Recomp has no game code in it", true,
-            "It has to be built on a Mac from your game files and put in the app: see docs/ios.md.");
-    return false;
+    // An iOS app can't run a compiler or load code it just made: the game's own code runs in the interpreter
+    // (runtime/interp.c), straight from the copied files. A library built on a Mac and put in the app is used if
+    // there is one (it is faster), but nothing needs it.
+    (void)gamelib_present;
+    return true;
 #endif
     int cores = SDL_GetNumLogicalCPUCores(), ram_gb = SDL_GetSystemRAM() / 1024;
     GameBuildOpts o = {build_progress, cores < ram_gb - 2 ? cores : ram_gb - 2 > 1 ? ram_gb - 2 : 1};
