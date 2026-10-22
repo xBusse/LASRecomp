@@ -1,0 +1,51 @@
+#!/bin/bash
+# make ios-deps: the libraries the iOS app links, built as static libraries for an arm64 iPhone / iPad (IOS_MIN, default
+# 16.0) from the same pinned sources as `make deps` (tools/build_deps_macos.sh) into build/ios-deps:
+#   SDL3; FFmpeg (LGPL only, no GPL parts: just what the game's movies need - WebM: VP9 video + Vorbis audio, plus
+#   VP8 / Opus / H.264 / AAC in WebM or MP4 - and swscale).
+# Static, because an iOS app can only load libraries signed with it: everything but the game code library is inside the
+# one executable. Needs: Xcode (xcrun, the iPhoneOS SDK), cmake, ninja. Each step is skipped when its output exists.
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+MIN=${IOS_MIN:-16.0}
+P=$PWD/build/ios-deps
+S=$PWD/build/ios-deps-src
+mkdir -p "$S" "$P/lib" "$P/include"
+SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+JOBS=$(sysctl -n hw.ncpu)
+
+fetch() {  # url sha256 file
+    [ -f "$S/$3" ] || { curl -fsSL -o "$S/$3.part" "$1" && mv "$S/$3.part" "$S/$3"; }
+    echo "$2  $S/$3" | shasum -a 256 -c --quiet
+}
+unpack() { rm -rf "$S/$2" && mkdir -p "$S/$2" && tar -xf "$S/$1" -C "$S/$2" --strip-components 1; }
+
+fetch https://github.com/libsdl-org/SDL/releases/download/release-3.4.18/SDL3-3.4.18.tar.gz \
+      9c75cf16330322c217dedd2e0609f1124f1b54b8633e763467b4684d0f4334a3 SDL3-3.4.18.tar.gz
+fetch https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz \
+      8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e ffmpeg-9.0.2.tar.xz
+
+if [ ! -f "$P/lib/libSDL3.a" ]; then
+    unpack SDL3-3.4.18.tar.gz sdl
+    cmake -S "$S/sdl" -B "$S/sdl/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$P" \
+          -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_ARCHITECTURES=arm64 \
+          -DCMAKE_OSX_DEPLOYMENT_TARGET="$MIN" -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF \
+          -DSDL_INSTALL_DOCS=OFF -DSDL_OPENGL=OFF -DSDL_OPENGLES=OFF -DSDL_VULKAN=OFF
+    cmake --build "$S/sdl/build" -j"$JOBS" && cmake --install "$S/sdl/build"
+fi
+
+if [ ! -f "$P/lib/libavcodec.a" ]; then
+    unpack ffmpeg-9.0.2.tar.xz ffmpeg
+    FLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=$MIN"
+    (cd "$S/ffmpeg" && ./configure --prefix="$P" --enable-cross-compile --target-os=darwin --arch=arm64 \
+        --cc="xcrun --sdk iphoneos clang" --extra-cflags="$FLAGS" --extra-ldflags="$FLAGS" \
+        --enable-static --disable-shared --enable-pic \
+        --disable-autodetect --disable-programs --disable-doc --disable-network --disable-avdevice --disable-avfilter \
+        --disable-swresample --disable-everything \
+        --enable-protocol=file --enable-demuxer=matroska,mov \
+        --enable-decoder=vp9,vp8,vorbis,opus,h264,aac --enable-parser=vp9,vp8,vorbis,opus,h264,aac \
+        && make -j"$JOBS" && make install)
+fi
+
+echo "build/ios-deps ready (iOS $MIN, arm64):"
+ls -1 "$P"/lib/*.a

@@ -97,6 +97,11 @@ void rt_paths_init(void) {
         const char *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
         if (xdg && *xdg == '/') snprintf(root, sizeof root, "%s/lasrecomp", xdg);
         else snprintf(root, sizeof root, "%s/.local/share/lasrecomp", home && *home ? home : "/tmp");
+#elif LAS_IOS
+        // The app's Documents folder: the Files app shows it (UIFileSharingEnabled, tools/ios/Info.plist), which is
+        // how the player puts their exefs / romfs folders in (Import/) and takes their saves out
+        const char *home = getenv("HOME");
+        snprintf(root, sizeof root, "%s/Documents", home && *home ? home : "/tmp");
 #else
         const char *home = getenv("HOME");
         snprintf(root, sizeof root, "%s/Library/Application Support/" RT_BUNDLE_ID, home && *home ? home : "/tmp");
@@ -124,7 +129,11 @@ bool rt_resource(const char *name, const char *dev_rel, char *out, size_t n) {
     char c[4][1100] = {{0}};
     if (name) {
         snprintf(c[0], sizeof c[0], "%s" SEP "%s", g_exe_dir, name);
+#if LAS_IOS
+        snprintf(c[1], sizeof c[1], "%s" SEP "Frameworks" SEP "%s", g_exe_dir, name);  // the .app's Frameworks/ (the game code)
+#else
         snprintf(c[1], sizeof c[1], "%s" SEP ".." SEP "Resources" SEP "%s", g_exe_dir, name);  // .app/Contents/Resources
+#endif
     }
     if (dev_rel) {
         snprintf(c[2], sizeof c[2], "%s" SEP "%s", g_start, dev_rel);

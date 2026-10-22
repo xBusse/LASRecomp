@@ -1,11 +1,9 @@
 // macOS host layer (runtime/platform.h).
-#include <crt_externs.h>
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
-#include <mach/mach_vm.h>
 #include <mach/thread_policy.h>
 #include <pthread.h>
 #include <signal.h>
@@ -16,11 +14,35 @@
 #include <unistd.h>
 
 #include "../platform.h"
+#if LAS_IOS
+#include <mach/vm_map.h>  // (the iOS SDK has no mach_vm.h: vm_allocate takes the same 64-bit addresses there)
+#else
+#include <crt_externs.h>
+#include <mach/mach_vm.h>
+#endif
 
 static mach_timebase_info_data_t tb;
 
-void plat_init(void) {}
+void plat_init(void) {
+#if LAS_IOS
+    signal(SIGPIPE, SIG_IGN);  // (a closed log pipe or socket must not end the app)
+#endif
+}
 
+// iOS: only dirty pages count against the app's memory limit (jetsam), not the 12.5 GB claimed here; the window needs
+// the com.apple.developer.kernel.extended-virtual-addressing entitlement (tools/ios/entitlements.plist) to be allowed
+// that much address space, and the increased-memory-limit one for the game's own working set.
+#if LAS_IOS
+bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
+    vm_address_t a = (vm_address_t)lo;
+    return vm_allocate(mach_task_self(), &a, (vm_size_t)(hi - lo), VM_FLAGS_FIXED) == KERN_SUCCESS;
+}
+
+bool plat_reset_guest(uint64_t lo, uint64_t hi) {
+    vm_address_t a = (vm_address_t)lo;
+    return vm_allocate(mach_task_self(), &a, (vm_size_t)(hi - lo), VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) == KERN_SUCCESS;
+}
+#else
 bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
     // Everything readable/writable: macOS pages are 16K but the guest maps at 4K granularity.
     // Untouched pages cost nothing.
@@ -33,6 +55,7 @@ bool plat_reset_guest(uint64_t lo, uint64_t hi) {
     mach_vm_address_t a = lo;
     return mach_vm_allocate(mach_task_self(), &a, hi - lo, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) == KERN_SUCCESS;
 }
+#endif
 
 void plat_commit(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
 
@@ -77,9 +100,13 @@ bool plat_exe_path(char *buf, size_t size) {
 }
 
 void plat_exec(char *const argv[]) {
+#if LAS_IOS
+    (void)argv;  // (an iOS app can't replace itself: main.c reports that the guest window wasn't free)
+#else
     if (argv) { execv(argv[0], argv); return; }
     char path[4096];
     if (plat_exe_path(path, sizeof path)) execv(path, *_NSGetArgv());
+#endif
 }
 
 const char *plat_symbol(uint64_t pc, uint64_t *offset) {
@@ -131,6 +158,10 @@ void plat_crash_handler_install(void) {
 extern char **environ;
 
 PlatProc plat_spawn(const char *const argv[], const char *log_path, bool append_log) {
+#if LAS_IOS
+    (void)argv, (void)log_path, (void)append_log;  // (iOS apps can't start programs: the game code is built on a Mac)
+    return 0;
+#else
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_addopen(&fa, 1, log_path ? log_path : "/dev/null",
@@ -145,6 +176,7 @@ PlatProc plat_spawn(const char *const argv[], const char *log_path, bool append_
     posix_spawnattr_destroy(&at);
     posix_spawn_file_actions_destroy(&fa);
     return rc ? 0 : (PlatProc)pid;
+#endif
 }
 
 void plat_proc_kill(PlatProc p) {

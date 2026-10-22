@@ -5,6 +5,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// LAS_IOS: building for an iPhone / iPad (runtime/platform/macos.c is the host layer there too: same Darwin, with
+// no exec / spawn / mach_vm_*). LAS_TOUCH: the screen is the controller (runtime/ui/touch_pad.mm).
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define LAS_IOS 1
+#define LAS_TOUCH 1
+#else
+#define LAS_IOS 0
+#endif
+
 #ifdef _WIN32
 #include "platform/win_compat.h"
 #elif defined(__linux__)

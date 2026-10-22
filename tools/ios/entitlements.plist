@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- The game's 12.5 GB address window (runtime/rt.h GUEST_LO..GUEST_HI) is claimed at startup; only dirty pages
+         count against the memory limit, but the range itself needs this -->
+    <key>com.apple.developer.kernel.extended-virtual-addressing</key>
+    <true/>
+    <!-- The game's working set (the Switch game's 4 GB of RAM, plus textures and shader caches) -->
+    <key>com.apple.developer.kernel.increased-memory-limit</key>
+    <true/>
+</dict>
+</plist>

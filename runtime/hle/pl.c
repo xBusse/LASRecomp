@@ -12,6 +12,7 @@
 #include <strings.h>
 
 #include "../hle.h"
+#include "../paths.h"
 
 typedef struct { uint64_t addr, size; } Font;
 static Font fonts[2];  // [0] Standard (every type), [1] NintendoExt when a dump provides it
@@ -121,6 +122,11 @@ static void load_fonts(void) {
                          "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf"};
     for (size_t i = 0; i < sizeof std / sizeof *std && !fonts[0].addr; i++)
         if (std[i]) load_one(std[i], &fonts[0]);
+    if (!fonts[0].addr) {  // iOS has no system font files to read: the start screen's own (TrueType, Latin only), until the
+        char own[1100];    // player's fonts/ (Documents/fonts, from the Files app) are there
+        if (rt_resource("Baloo2-SemiBold.ttf", "third_party/fonts/Baloo2/Baloo2-SemiBold.ttf", own, sizeof own))
+            load_one(own, &fonts[0]);
+    }
     if (!fonts[0].addr) FATAL("no usable system font substitute\n");
     if (!load_one("fonts/nintendo_ext_003.bfttf", &fonts[1])) load_one("fonts/nintendo_ext_003.ttf", &fonts[1]);
 }

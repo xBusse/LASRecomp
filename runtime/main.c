@@ -1,5 +1,9 @@
 // LAS Recomp entry: load modules, set up the kernel, run nn::init::Start on the main thread.
 #include <SDL3/SDL.h>
+#include "platform.h"
+#if LAS_IOS
+#include <SDL3/SDL_main.h>  // (main() becomes the SDL_main that SDL's UIKit app delegate calls)
+#endif
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,8 +40,14 @@ static void rtld_init_main(Cpu *c) { module_init(c, &g_modules[0]); }
 
 // Claim the guest address range before anything else can map there. The host allocator places
 // regions at random addresses in the same window; on a collision, re-exec for a fresh layout.
+static bool g_guest_reserved;
 __attribute__((constructor(101))) static void reserve_guest_space(void) {
-    if (plat_reserve_guest(GUEST_LO, GUEST_HI)) return;
+    if ((g_guest_reserved = plat_reserve_guest(GUEST_LO, GUEST_HI))) return;
+#if LAS_IOS
+    // An iOS app can't re-exec for a fresh layout: main() reports it (the extended-virtual-addressing entitlement,
+    // tools/ios/entitlements.plist, is what lets the process have this address range)
+    return;
+#endif
     const char *tries = getenv("LARECOMP_REEXEC");
     int n = tries ? atoi(tries) : 0;
     if (n >= 20) {
@@ -175,6 +185,16 @@ int main(int argc, char **argv) {
         else if (argv[i][0] != '-') root = arg_root;
     }
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
+#if LAS_IOS
+    if (!g_guest_reserved) {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "LAS Recomp",
+                                 "The game's memory range couldn't be reserved on this device. It needs the 'extended "
+                                 "virtual addressing' and 'increased memory limit' entitlements "
+                                 "(tools/ios/entitlements.plist) and an iPhone with 6 GB of RAM or more.", NULL);
+        fprintf(stderr, "FATAL: guest address range %llx-%llx is not free\n", GUEST_LO, GUEST_HI);
+        return 1;
+    }
+#endif
     for (bool title = !skip_launcher;;) {
         if (title) {  // start screen (runtime/ui/launcher.mm): game files setup, seed choice, settings
             extern void launcher_run(const char *root);

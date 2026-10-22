@@ -11,6 +11,7 @@
 #endif
 
 #include "paths.h"
+#include "platform.h"
 #include "rt.h"
 
 static const GameLibTables *g_tables;
@@ -46,12 +47,16 @@ static int candidates(const char *game_dir, char out[3][1100]) {
     return n;
 }
 
+// iOS: the library is built on a Mac (make ios-gen) and travels inside the app, in Frameworks/ (tools/ios/bundle_ios.sh):
+// there is no id file beside it (the signed bundle holds nothing but code there); open_lib checks the id it carries.
+static bool bundled(const char *path) { return LAS_IOS && strstr(path, "/Frameworks/") != NULL; }
+
 bool gamelib_present(const char *game_dir) {
     if (g_tables) return true;
     char c[3][1100];
     int n = candidates(game_dir, c);
     for (int i = 0; i < n; i++)
-        if (exists(c[i]) && id_matches(c[i])) return true;
+        if (exists(c[i]) && (bundled(c[i]) || id_matches(c[i]))) return true;
     return false;
 }
 
@@ -84,7 +89,8 @@ bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
         const char *env = getenv("LARECOMP_GAME_LIB");
         for (int i = 0; i < n && !g_tables; i++) {
             if (!exists(c[i])) continue;
-            bool given = i == 0 && env && *env;  // LARECOMP_GAME_LIB: loaded as given, the library's own id decides
+            bool given = (i == 0 && env && *env) || bundled(c[i]);  // (LARECOMP_GAME_LIB / the iOS bundle: loaded as given,
+                                                                    // the library's own id decides)
             if (!given && !id_matches(c[i])) {
                 snprintf(g_error, sizeof g_error, "%s was built for another version", c[i]);
                 continue;

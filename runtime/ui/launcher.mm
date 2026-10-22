@@ -281,6 +281,14 @@ static float extract_progress(void) {
 
 // Builds the game code from the copied files (a few minutes); false = failed (the job line says so)
 static bool build_game_code(void) {
+#if LAS_IOS
+    // An iOS app can't run a compiler or load code it just made: the game code is built on a Mac from the same files
+    // (make ios-gen, docs/ios.md) and travels inside the app. Here it is only checked for.
+    if (gamelib_present(g_root.c_str())) return true;
+    set_job("This copy of LAS Recomp has no game code in it", true,
+            "It has to be built on a Mac from your game files and put in the app: see docs/ios.md.");
+    return false;
+#endif
     int cores = SDL_GetNumLogicalCPUCores(), ram_gb = SDL_GetSystemRAM() / 1024;
     GameBuildOpts o = {build_progress, cores < ram_gb - 2 ? cores : ram_gb - 2 > 1 ? ram_gb - 2 : 1};
     char why[256] = "";
@@ -838,6 +846,16 @@ static void prelaunch_tab(float sc) {
 extern "C" void launcher_run(const char *root) {
     g_root = root;
     g_start_screen = 1;
+#if LAS_IOS
+    {   // (no folder dialog here: the player copies their exefs / romfs folders into LAS Recomp > Import with the
+        // Files app, and that folder is the source)
+        std::string imp = std::string(rt_data_root()) + "/Import";
+        mkdir(imp.c_str(), 0755);
+        pthread_mutex_lock(&g_lock);
+        if (g_src.empty()) g_src = imp;
+        pthread_mutex_unlock(&g_lock);
+    }
+#endif
     static bool update_checked;  // (once per launch, not again after a "Title screen" reboot)
     if (!update_checked && !getenv("LARECOMP_NO_UPDATE_CHECK")) {
         update_checked = true;
@@ -1285,6 +1303,10 @@ extern "C" void launcher_run(const char *root) {
                 };
                 std::string src_d = "The folder with your own game folders (exefs/romfs) of The Legend of Zelda: Link's "
                                     "Awakening for Nintendo Switch, version 1.0.0. The game isn't included with LAS Recomp.";
+#if LAS_IOS
+                src_d = "Copy the exefs and romfs folders of your own game (version 1.0.0) into LAS Recomp > Import "
+                        "with the Files app (On My iPhone), then press Set up game files.";
+#endif
                 if (!src.empty()) src_d += "\n\nChosen: " + src;
                 // the step that's running / its result, under the rows and in the Set up row's explanation
                 const std::string &job_line = job;

@@ -2,6 +2,7 @@
 # macOS: Homebrew clang/SDL3/FFmpeg, Metal renderer.
 # Windows: MSYS2 UCRT64 shell (see docs/BUILD-windows.md), clang + Vulkan renderer.
 # Linux: clang + Vulkan renderer, x86-64 or aarch64 (see docs/linux.md).
+# iOS: IOS=1 on a Mac cross-builds the macOS host layer for an iPhone / iPad (see docs/ios.md): make ios-deps, ios-gen, ios.
 UNAME := $(shell uname -s)
 comma := ,
 ifneq ($(filter MINGW% MSYS% CYGWIN% Windows_NT,$(UNAME) $(OS)),)
@@ -27,14 +28,32 @@ endif
 GENSIMD  := --simd $(if $(filter aarch64,$(ARCH)),asm,c)
 endif
 
+# iOS (IOS=1): the Darwin host layer cross-built for an iPhone / iPad, arm64, IOS_MIN or newer, sideloaded (docs/ios.md).
+# Its libraries (static SDL3 and FFmpeg) are in build/ios-deps (make ios-deps). The game code is built here, on the Mac,
+# and travels inside the app: an iOS app can't run a compiler or load code it made itself.
+IOS      ?=
+IOS_MIN  ?= 16.0
+ifeq ($(IOS),1)
+ifneq ($(PLATFORM),macos)
+$(error IOS=1 needs a Mac with Xcode)
+endif
+IOS_SDK  := $(shell xcrun --sdk iphoneos --show-sdk-path 2>/dev/null)
+ifeq ($(IOS_SDK),)
+$(error no iPhoneOS SDK: install Xcode, then xcode-select -s /Applications/Xcode.app)
+endif
+IOSFLAGS := -target arm64-apple-ios$(IOS_MIN) -isysroot $(IOS_SDK)
+B        ?= build/ios
+DEPS     ?= $(CURDIR)/build/ios-deps
+endif
+
 # B: build dir. MACOS_MIN: oldest macOS to run on (default: this one). DEPS: prefix with SDL3 / FFmpeg instead of
 # Homebrew's (make deps). `make app` sets all three (build/mac15, 15.0, build/deps); plain `make` uses none.
 B         ?= build
 MACOS_MIN ?=
 DEPS      ?=
 MINFLAG  := $(if $(MACOS_MIN),-mmacosx-version-min=$(MACOS_MIN))
-CC       := clang $(MINFLAG) $(CROSS)
-CXX      := clang++ $(MINFLAG) $(CROSS)
+CC       := clang $(MINFLAG) $(CROSS) $(IOSFLAGS)
+CXX      := clang++ $(MINFLAG) $(CROSS) $(IOSFLAGS)
 IMGUI    := third_party/imgui
 GENFLAGS := -O1 -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -Iruntime
 
@@ -65,6 +84,18 @@ UIFLAGS  := -fobjc-arc
 GAMELIB  := $(B)/lasgame.dylib
 GAMELIB_LDFLAGS := -dynamiclib -undefined dynamic_lookup  # (the runtime functions it calls: the app's own)
 GAMELIB_SHARED := -shared -Wl,-undefined,dynamic_lookup  # (the same, for the start screen's build: zig cc)
+ifeq ($(IOS),1)
+# static SDL3 / FFmpeg (build/ios-deps); the executable exports the runtime functions the game code library calls
+# (-export_dynamic) and the library is found in the app's Frameworks/ folder (@rpath, tools/ios/bundle_ios.sh)
+DEPINC   := -I$(DEPS)/include
+LDFLAGS  := -L$(DEPS)/lib -lSDL3 -lavformat -lavcodec -lavutil -lswscale -lz -liconv -lbz2 -lc++ \
+            -Wl,-export_dynamic -Wl,-rpath,@executable_path/Frameworks \
+            -framework UIKit -framework Foundation -framework Metal -framework MetalFX -framework QuartzCore \
+            -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers -framework GameController \
+            -framework CoreHaptics -framework CoreMotion -framework AudioToolbox -framework AVFoundation \
+            -framework CoreMedia -framework CoreVideo -framework CoreBluetooth -framework OpenGLES -framework Security
+GAMELIB_LDFLAGS := -dynamiclib -undefined dynamic_lookup -Wl,-install_name,@rpath/$(notdir $(GAMELIB))
+endif
 else ifeq ($(PLATFORM),linux)
 EXE      := $(B)/lasrecomp
 DEPINC   := $(if $(DEPS),-I$(DEPS)/include)
@@ -217,6 +248,19 @@ app:
 # macOS release disk image (the .app + an Applications shortcut to drag it onto): build/dist/LAS Recomp-<v>-macOS.dmg
 dmg: app
 	tools/make_dmg.sh
+
+# iOS (docs/ios.md): make ios-deps (static SDL3 + LGPL FFmpeg for the device, once), make ios-gen (the game code from
+# extracted/: the same generator as `make gen`, built into build/ios/lasgame.dylib), make ios (build/ios/LAS Recomp.ipa,
+# unsigned: AltStore / SideStore / Sideloadly sign it when they install it). No game files.
+ios-deps:
+	tools/ios/build_deps_ios.sh
+ios-gen:
+	$(MAKE) gen
+	$(MAKE) IOS=1 build/ios/lasgame.dylib
+ios:
+	@[ -f build/ios-deps/lib/libSDL3.a ] || { echo "make ios-deps first"; exit 1; }
+	$(MAKE) IOS=1 build/ios/lasrecomp
+	tools/ios/bundle_ios.sh build/ios/lasrecomp
 
 # Windows: build/dist/LAS Recomp-<version>-windows.zip, top folder "LAS Recomp/": the exe, the seed generator
 # helper (make rando-helper), what the start screen builds the game code with on the player's machine (make gen-helper,
