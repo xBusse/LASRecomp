@@ -2,7 +2,7 @@
 # macOS: Homebrew clang/SDL3/FFmpeg, Metal renderer.
 # Windows: MSYS2 UCRT64 shell (see docs/BUILD-windows.md), clang + Vulkan renderer.
 # Linux: clang + Vulkan renderer, x86-64 or aarch64 (see docs/linux.md).
-# iOS: IOS=1 on a Mac cross-builds the macOS host layer for an iPhone / iPad (see docs/ios.md): make ios-deps, ios-gen, ios.
+# iOS: IOS=1 on a Mac cross-builds the macOS host layer for an iPhone / iPad (see docs/ios.md): make ios-deps, then make ios.
 UNAME := $(shell uname -s)
 comma := ,
 ifneq ($(filter MINGW% MSYS% CYGWIN% Windows_NT,$(UNAME) $(OS)),)
@@ -29,8 +29,8 @@ GENSIMD  := --simd $(if $(filter aarch64,$(ARCH)),asm,c)
 endif
 
 # iOS (IOS=1): the Darwin host layer cross-built for an iPhone / iPad, arm64, IOS_MIN or newer, sideloaded (docs/ios.md).
-# Its libraries (static SDL3 and FFmpeg) are in build/ios-deps (make ios-deps). The game code is built here, on the Mac,
-# and travels inside the app: an iOS app can't run a compiler or load code it made itself.
+# Its libraries (static SDL3 and FFmpeg) are in build/ios-deps (make ios-deps). The app has no compiled game code: it runs the
+# game's own code in its interpreter (an iOS app can't run a compiler or load code it made itself).
 IOS      ?=
 IOS_MIN  ?= 16.0
 ifeq ($(IOS),1)
@@ -280,32 +280,17 @@ app:
 dmg: app
 	tools/make_dmg.sh
 
-# iOS (docs/ios.md): make ios-deps (static SDL3 + LGPL FFmpeg for the device, once), then one of
-#   make ios-public   build/ios/LASRecomp-public.ipa: no game code in it, whatever else is in build/ios. The app runs the
-#                     game's own code in its interpreter, from the player's own files. This is the one to share.
-#   make ios-private  build/ios/LASRecomp-private.ipa: with the game code compiled from YOUR game files in extracted/
-#                     (the same generator as `make gen`, built into build/ios/lasgame.dylib), several times faster.
-#                     Derived from the game: for your own phone only, never share it.
-# `make ios` is ios-public. Unsigned: AltStore / SideStore / Sideloadly sign them when they install them.
+# iOS (docs/ios.md): make ios-deps (static SDL3 + LGPL FFmpeg for the device, once), then make ios:
+# build/ios/LASRecomp.ipa, with no game code in it: the app runs the game's own code in its interpreter, from the
+# player's own files. Unsigned: AltStore / SideStore / Sideloadly sign it when they install it.
 ios-deps:
 	tools/ios/build_deps_ios.sh
-ios-gen:
-	@[ -x tools/venv/bin/python ] || { echo "no tools/venv: python3 -m venv tools/venv && tools/venv/bin/pip install lz4 capstone unicorn"; exit 1; }
-	@[ -f extracted/exefs/main ] && [ -f extracted/exefs/sdk ] || { echo "no extracted/exefs/main and sdk: your own game files go in extracted/ (docs/ios.md)"; exit 1; }
-	$(MAKE) gen
-	$(MAKE) IOS=1 build/ios/lasgame.dylib
 ios-app:
 	@[ -f build/ios-deps/lib/libSDL3.a ] || { echo "make ios-deps first"; exit 1; }
 	$(MAKE) IOS=1 build/ios/lasrecomp
-ios-public:
-	$(MAKE) ios-app
-	tools/ios/bundle_ios.sh build/ios/lasrecomp public
-ios-private:
-	$(MAKE) ios-gen
-	$(MAKE) ios-app
-	tools/ios/bundle_ios.sh build/ios/lasrecomp private
 ios:
-	$(MAKE) ios-public
+	$(MAKE) ios-app
+	tools/ios/bundle_ios.sh build/ios/lasrecomp
 
 # Windows: build/dist/LAS Recomp-<version>-windows.zip, top folder "LAS Recomp/": the exe, the seed generator
 # helper (make rando-helper), what the start screen builds the game code with on the player's machine (make gen-helper,
@@ -403,7 +388,7 @@ appimages:
 smoketest:
 	tools/linux/smoketest.sh
 
-.PHONY: ios ios-deps ios-gen ios-app ios-public ios-private dmg all gen gen-helper gen-objs runtime-objs deps deps-windows app dist rando-helper appimage appimages smoketest
+.PHONY: ios ios-deps ios-app dmg all gen gen-helper gen-objs runtime-objs deps deps-windows app dist rando-helper appimage appimages smoketest
 
 build/test_shaders: tools/test_shaders.m runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h
 	clang -O1 -fobjc-arc -framework Metal -framework Foundation -o $@ tools/test_shaders.m runtime/nvn/maxwell/translate.c

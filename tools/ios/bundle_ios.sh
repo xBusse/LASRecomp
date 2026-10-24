@@ -1,24 +1,18 @@
 #!/bin/bash
-# tools/ios/bundle_ios.sh <exe> public|private: build/ios/LAS Recomp.app and build/ios/LASRecomp-<mode>.ipa from <exe>
-# (make ios-public / ios-private).
-#   public   never any game code: a build/ios/lasgame.dylib left by an earlier `make ios-gen` is ignored, and the finished
-#            .ipa is checked to hold none. The app runs the game's code in its interpreter from the player's own files.
-#   private  with build/ios/lasgame.dylib (make ios-gen): game code compiled from YOUR game files. For your own phone only.
+# tools/ios/bundle_ios.sh <exe>: build/ios/LAS Recomp.app and build/ios/LASRecomp.ipa from <exe> (make ios).
+# Never any game code: the finished .ipa is checked to hold none. The app runs the game's code in its interpreter from
+# the player's own files.
 #   LASRecomp.app/LASRecomp                the executable (static SDL3 and FFmpeg inside: build/ios-deps)
-#   LASRecomp.app/Frameworks/lasgame.dylib the game code, private mode only (the app can't build it: an iOS app can't run a
-#                                          compiler or load code it made itself, docs/ios.md)
 #   LASRecomp.app/*.png, Baloo2*           icons, the start screen's font (OFL)
-# No game files, and game code only in private mode. The .ipa is ad-hoc signed with tools/ios/entitlements.plist
+# No game files and no game code. The .ipa is ad-hoc signed with tools/ios/entitlements.plist
 # only so the entitlements travel with it: AltStore / SideStore / Sideloadly sign it again with the player's own
 # certificate when they install it.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 EXE=${1:-build/ios/lasrecomp}
-MODE=${2:-public}
-case "$MODE" in public|private) ;; *) echo "usage: $0 <exe> public|private"; exit 1 ;; esac
 OUT=build/ios
 APP="$OUT/LAS Recomp.app"
-IPA="$OUT/LASRecomp-$MODE.ipa"
+IPA="$OUT/LASRecomp.ipa"
 IOS_MIN=${IOS_MIN:-16.0}
 BUNDLE_ID=${BUNDLE_ID:-$(sed -n 's/^#define RT_BUNDLE_ID "\(.*\)"/\1/p' runtime/paths.h)}
 VERSION=$(sed -n 's/^#define LARECOMP_VERSION "\(.*\)"/\1/p' runtime/ui/launcher.mm)
@@ -30,7 +24,7 @@ esac
 # no game code inside the executable: it is built on the player's own files and kept in Frameworks/
 if nm "$EXE" | grep ' _f_70' >/dev/null; then echo "$EXE has game code linked in"; exit 1; fi
 
-rm -rf "$APP" "$IPA" "$OUT/Payload" "$OUT/LAS Recomp.ipa"
+rm -rf "$APP" "$IPA" "$OUT/Payload" "$OUT/LAS Recomp.ipa" "$OUT/LASRecomp-public.ipa" "$OUT/LASRecomp-private.ipa"
 mkdir -p "$APP/Frameworks"
 cp "$EXE" "$APP/LASRecomp"
 strip -S "$APP/LASRecomp"
@@ -48,15 +42,8 @@ cp third_party/fonts/DejaVu/DejaVuSans.ttf "$APP/"  # (the game's font engine ne
 cp third_party/fonts/DejaVu/LICENSE "$APP/DejaVu-LICENSE.txt"
 
 cp third_party/fonts/DejaVu/DejaVuSans-Bold.ttf "$APP/" 2>/dev/null || true  # (the start screen's font, launcher.mm)
-if [ "$MODE" = private ]; then
-    [ -f "$OUT/lasgame.dylib" ] || { echo "no $OUT/lasgame.dylib: make ios-gen first (make ios-private does)"; exit 1; }
-    cp "$OUT/lasgame.dylib" "$APP/Frameworks/lasgame.dylib"
-    echo "game code: included ($(du -h "$OUT/lasgame.dylib" | cut -f1)), id $(cat "$OUT/lasgame.dylib.id" 2>/dev/null || echo '?')"
-    echo "PRIVATE build: it holds code made from your game files. Do not share this .ipa."
-else
-    rmdir "$APP/Frameworks"
-    echo "public build: no game code inside; the app runs the game's own code in its interpreter"
-fi
+rmdir "$APP/Frameworks"
+echo "no game code inside; the app runs the game's own code in its interpreter"
 
 # entitlements ride in an ad-hoc signature (every Mach-O, the library first)
 for f in "$APP"/Frameworks/*.dylib "$APP/LASRecomp"; do
@@ -67,8 +54,8 @@ mkdir -p "$OUT/Payload"
 cp -R "$APP" "$OUT/Payload/"
 (cd "$OUT" && zip -qry "$(basename "$IPA")" Payload)
 rm -rf "$OUT/Payload"
-if [ "$MODE" = public ] && unzip -l "$IPA" | grep -qi 'lasgame'; then
+if unzip -l "$IPA" | grep -qi 'lasgame'; then
     rm -f "$IPA"
-    echo "REFUSED: the public .ipa held game code (lasgame)"; exit 1
+    echo "REFUSED: the .ipa held game code (lasgame)"; exit 1
 fi
 echo "$IPA"

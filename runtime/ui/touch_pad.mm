@@ -21,7 +21,9 @@
 
 #include "imgui.h"
 #include "../platform.h"
+extern "C" {
 #include "../settings.h"
+}
 
 #if LAS_TOUCH
 

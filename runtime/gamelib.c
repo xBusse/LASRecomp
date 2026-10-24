@@ -48,7 +48,7 @@ static int candidates(const char *game_dir, char out[3][1100]) {
     return n;
 }
 
-// iOS: the library is built on a Mac (make ios-gen) and travels inside the app, in Frameworks/ (tools/ios/bundle_ios.sh):
+// iOS: a library built on a Mac may travel inside the app, in Frameworks/ (the stock iOS bundle has none):
 // there is no id file beside it (the signed bundle holds nothing but code there); open_lib checks the id it carries.
 static bool bundled(const char *path) { return LAS_IOS && strstr(path, "/Frameworks/") != NULL; }
 
