@@ -1596,7 +1596,9 @@ void ui_window_init(void) {
     // The display's vsync stays on: without it frames show as soon as they're done, which tears (seen on a 5120x1440
     // display), for ~2-3 fps near the limit at most (the game paces itself to vi.c's emulated 60 Hz vsync, and the two
     // clocks drift). LARECOMP_DISPLAY_SYNC=0: off (tests).
+#if !TARGET_OS_IPHONE  // (iOS: the display is always synced, the property does not exist there)
     layer.displaySyncEnabled = !getenv("LARECOMP_DISPLAY_SYNC") || atoi(getenv("LARECOMP_DISPLAY_SYNC")) != 0;
+#endif
     layer.framebufferOnly = getenv("LARECOMP_WINDOW_SHOT") ? NO : YES;
 }
 

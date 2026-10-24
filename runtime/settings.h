@@ -82,6 +82,10 @@ typedef struct {
     int timer_pos;         // TIMER_POS_*: which bottom corner it sits in
     bool livesplit;        // drive LiveSplit (its Server component) over TCP: start, splits, game time
     char livesplit_host[64];  // host:port of the LiveSplit Server ("localhost:16834")
+    // on-screen controller (iOS; runtime/ui/touch_pad.mm, the Touch tab)
+    float touch_opacity;      // 0.1..1: how solid the controller is drawn (0.4: the default look)
+    float touch_size;         // 0.4..2: every control, bigger or smaller
+    float touch_ctl[10][3];   // per control (A B X Y L R Minus Plus Menu Stick): dx, dy (screen heights) from its default spot, size change
     char rando_seed[128];  // active randomizer seed (rando/<name>/), empty = vanilla
     char rando_options[48];  // the Randomizer tab's New seed options: a seed ID without its random part (empty = defaults)
 } Settings;

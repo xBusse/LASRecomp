@@ -43,6 +43,8 @@ Settings g_settings = {
     .upscaler_auto = true,
     .res_auto = true,
     .livesplit_host = "localhost:16834",
+    .touch_opacity = 0.4f,
+    .touch_size = 1.0f,
 #ifndef __APPLE__
     .bg_input = true,  // (as before the setting; on macOS it needs Input Monitoring permission, so Off there)
 #endif
@@ -210,6 +212,12 @@ void settings_load(void) {
         else if (!strcmp(key, "timer_position")) g_settings.timer_pos = !strcmp(val, "right") ? TIMER_POS_RIGHT : TIMER_POS_LEFT;
         else if (!strcmp(key, "livesplit")) g_settings.livesplit = atoi(val) != 0;
         else if (!strcmp(key, "rando_options")) strlcpy(g_settings.rando_options, val, sizeof g_settings.rando_options);
+        else if (!strcmp(key, "touch_opacity")) g_settings.touch_opacity = (float)atof(val);
+        else if (!strcmp(key, "touch_size")) g_settings.touch_size = (float)atof(val);
+        else if (!strncmp(key, "touch_ctl", 9) && key[9] >= '0' && key[9] <= '9' && !key[10]) {
+            float *o = g_settings.touch_ctl[key[9] - '0'];
+            sscanf(val, "%f %f %f", &o[0], &o[1], &o[2]);
+        }
         else if (!strcmp(key, "livesplit_host")) strlcpy(g_settings.livesplit_host, val, sizeof g_settings.livesplit_host);
         else if (!strcmp(key, "tunic")) col_parse(&g_settings.tunic, val);  // (colour rows: runtime/cosmetic_colour.c)
         else if (!strcmp(key, "hearts")) col_parse(&g_settings.hearts, val);
@@ -282,6 +290,11 @@ void settings_save(void) {
     fprintf(f, "timer_position = %s\n", g_settings.timer_pos == TIMER_POS_RIGHT ? "right" : "left");
     fprintf(f, "timer = %d\nlivesplit = %d\nlivesplit_host = %s\n", g_settings.timer, g_settings.livesplit,
             g_settings.livesplit_host);
+    fprintf(f, "touch_opacity = %.2f\ntouch_size = %.2f\n", g_settings.touch_opacity, g_settings.touch_size);
+    for (int i = 0; i < 10; i++) {
+        const float *o = g_settings.touch_ctl[i];
+        if (o[0] != 0 || o[1] != 0 || o[2] != 0) fprintf(f, "touch_ctl%d = %.4f %.4f %.3f\n", i, o[0], o[1], o[2]);
+    }
     static const struct { const char *key; const CosColour *c; } cols[] = {
         {"tunic", &g_settings.tunic}, {"hearts", &g_settings.hearts}, {"hair", &g_settings.hair},
         {"shield", &g_settings.shield}, {"skin", &g_settings.skin},

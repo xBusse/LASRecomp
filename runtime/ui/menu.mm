@@ -77,6 +77,14 @@ static void set_open(bool open);
 extern "C" bool touch_pad_event(const SDL_Event *e);
 extern "C" void touch_pad_set_menu_open(bool open);
 extern "C" void touch_pad_draw(ImVec2 display, ImFont *font);
+extern "C" bool touch_pad_editing(void);  // the layout editor is up (iOS)
+extern "C" void touch_pad_edit(bool on);
+extern "C" void touch_pad_edit_panel(float x0, float y0, float x1, float y1);
+extern "C" const char *touch_pad_selected_name(void);
+extern "C" int touch_pad_selected_size(void);
+extern "C" void touch_pad_set_selected_size(int pct);
+extern "C" void touch_pad_reset_selected(void);
+extern "C" void touch_pad_reset_layout(void);
 extern "C" bool touch_pad_wanted(void);  // false: a controller is connected (it hides the screen controller)
 extern "C" void menu_touch_toggle(void) { set_open(!g_open.load()); }  // (its menu button; any thread that owns the event loop)
 extern "C" void menu_test_open(void) {
@@ -142,7 +150,7 @@ static std::atomic<int> g_kbd{0};  // 1 open, 2 confirmed, 3 cancelled
 static std::atomic<bool> g_last_pad{false};
 static char g_kbd_text[96];
 static int g_kbd_max = 8;
-static bool capturing() { return g_open.load() || g_kbd.load() == 1; }
+static bool capturing() { return g_open.load() || g_kbd.load() == 1 || touch_pad_editing(); }
 // The game gets no input while this is true (runtime/hle/input.c): menu or name entry up.
 extern "C" bool menu_input_captured(void) { return capturing(); }
 
@@ -545,6 +553,66 @@ static void tab_audio(void) {
     opt_end();
 }
 
+#if LAS_IOS
+// Touch (iOS only): how the on-screen controller looks, and the editor that moves and resizes its controls.
+static void tab_touch(bool in_game) {
+    opt_begin("##touch", ImGui::GetFontSize() / 34);
+    opt_section("On-screen controller");
+    float op = roundf(g_settings.touch_opacity * 100);
+    if (opt_slider("Opacity", &op, 10, 100, 5, 40, "%g%%", "How solid the buttons are drawn. Lower: more of the game shows through."))
+        g_settings.touch_opacity = op / 100.0f;
+    float sz = roundf(g_settings.touch_size * 100);
+    if (opt_slider("Size", &sz, 40, 200, 5, 100, "%g%%", "Every button and the stick, bigger or smaller together."))
+        g_settings.touch_size = sz / 100.0f;
+    opt_section("Layout");
+    if (in_game) {
+        if (opt_button("Edit layout", "Drag the buttons where you want them, and pick one to give it its own size. Closes this menu.")) {
+            set_open(false);
+            touch_pad_edit(true);
+        }
+    } else {
+        ImGui::TextDisabled("Get into the game to edit the layout.");
+    }
+    if (opt_button("Reset layout", "Every button back to its original place and size (opacity and overall size stay).")) {
+        touch_pad_reset_layout();
+        settings_save();
+    }
+    opt_end();
+}
+#endif
+
+// The layout editor's panel (iOS): over the game with the controller shown, buttons draggable (touch_pad.mm).
+static void touch_edit_panel(ImVec2 disp, float scale) {
+    float w = disp.y * 0.8f;
+    ImGui::SetNextWindowPos(ImVec2(disp.x * 0.5f, disp.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(w, 0), ImGuiCond_Always);
+    ImGui::Begin("##touchedit", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                                          ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoNav);
+    ImGui::PushFont(g_menu_font);
+    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "Edit layout");
+    ImGui::TextWrapped("Drag a button to move it. Tap one to pick it.");
+    const char *nm = touch_pad_selected_name();
+    if (nm) {
+        int pct = touch_pad_selected_size();
+        ImGui::Text("%s: size %d%%", nm, pct);
+        float bw = (w - 3 * ImGui::GetStyle().ItemSpacing.x - 2 * ImGui::GetStyle().WindowPadding.x) / 3;
+        if (ImGui::Button("Smaller", ImVec2(bw, 0))) touch_pad_set_selected_size(pct - 10);
+        ImGui::SameLine();
+        if (ImGui::Button("Bigger", ImVec2(bw, 0))) touch_pad_set_selected_size(pct + 10);
+        ImGui::SameLine();
+        if (ImGui::Button("Reset it", ImVec2(bw, 0))) touch_pad_reset_selected();
+    } else {
+        ImGui::TextDisabled("(nothing picked)");
+    }
+    if (ImGui::Button("Reset all")) touch_pad_reset_layout();
+    ImGui::SameLine();
+    if (ImGui::Button("Done")) touch_pad_edit(false);
+    ImGui::PopFont();
+    ImVec2 p = ImGui::GetWindowPos(), s = ImGui::GetWindowSize();
+    touch_pad_edit_panel(p.x, p.y, p.x + s.x, p.y + s.y);
+    ImGui::End();
+}
+
 // Quit: back to the start screen (in game: the game reboots to it) or out to the desktop. Each asks first (progress
 // since the last save is lost); B / Esc or Cancel backs out.
 extern "C" void rt_request_reboot(int kind);  // runtime/main.c (RT_REBOOT_TITLE = 2: the start screen)
@@ -730,7 +798,7 @@ static void focus_check(bool down, bool up, bool any_down, int focused_tab, int 
 static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
     // (id: the page; -1 = Prelaunch)
     struct Tab { const char *name; int id; bool on; };
-    Tab tabs[11];
+    Tab tabs[12];
     int ntabs = 0;
     if (prelaunch) tabs[ntabs++] = {"Prelaunch", -1, true};
     static const char *names[] = {"Video", "Audio", "Save Editor", "Randomizer", "Warp", "Cheats", "Gameplay",
@@ -739,6 +807,10 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                                                                 // Cheats, Warp, Save Editor, Quit (ids stay: test hooks)
     for (int i : order)  // (Quit: in game only - the start screen has its own QUIT, and an eleventh tab cut names short)
         if (i != 9 || !prelaunch) tabs[ntabs++] = {names[i], i, in_game || (i != 2 && i != 4 && i != 5)};
+#if LAS_IOS
+    tabs[ntabs++] = {"Touch", 10, true};  // (after Quit would be odd: before it)
+    if (tabs[ntabs - 2].id == 9) std::swap(tabs[ntabs - 1], tabs[ntabs - 2]);
+#endif
     int cur = 0;  // g_tab / g_tab_request hold ids
     for (int i = 0; i < ntabs; i++) if (tabs[i].id == g_tab) cur = i;
     if (!tabs[cur].on) cur = 0;
@@ -852,6 +924,9 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                 case 7: tab_cosmetics(); break;
                 case 8: controls_tab_draw(scale); break;
                 case 9: tab_quit(scale, in_game); break;
+#if LAS_IOS
+                case 10: tab_touch(in_game); break;
+#endif
                 }
                 static const char *scroll_test = getenv("LARECOMP_MENU_SCROLL");  // test hook: page scroll, 0..1
                 if (scroll_test) ImGui::SetScrollY(ImGui::GetScrollMaxY() * (float)atof(scroll_test));
@@ -1057,6 +1132,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     }
 
     if (kbd) keyboard_draw(io, scale);
+    if (LAS_IOS && !open && touch_pad_editing()) touch_edit_panel(io.DisplaySize, scale);
 #if LAS_IOS
     if (open) {  // scrolling by dragging a finger (a touch screen has no wheel): the scrollable window under the press
         static bool tracking, scrolling;
