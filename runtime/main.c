@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "game_addresses.h"
 #include "gamelib.h"
 #include "interp.h"
 #include "paths.h"
@@ -42,8 +43,15 @@ static void rtld_init_main(Cpu *c) { module_init(c, &g_modules[0]); }
 // Claim the guest address range before anything else can map there. The host allocator places
 // regions at random addresses in the same window; on a collision, re-exec for a fresh layout.
 static bool g_guest_reserved;
+// LARECOMP_REEXEC_FORCE=1 (test): the first process skips the reservation once and starts again, as when the range is
+// taken (the new process has LARECOMP_REEXEC set and reserves normally).
+#define REEXEC_FORCED "forced by LARECOMP_REEXEC_FORCE"
 __attribute__((constructor(101))) static void reserve_guest_space(void) {
-    if ((g_guest_reserved = plat_reserve_guest(GUEST_LO, GUEST_HI))) return;
+    const char *force = getenv("LARECOMP_REEXEC_FORCE");
+    bool forced = force && *force && strcmp(force, "0") && !getenv("LARECOMP_REEXEC");
+    if (forced) setenv("LARECOMP_REEXEC_WHY", REEXEC_FORCED, 1);
+    else if ((g_guest_reserved = plat_reserve_guest(GUEST_LO, GUEST_HI))) return;
+    else setenv("LARECOMP_REEXEC_WHY", "", 0);  // (the platform may have said what holds the range; else nothing more)
 #if LAS_IOS
     // An iOS app can't re-exec for a fresh layout: main() reports it (the extended-virtual-addressing entitlement,
     // tools/ios/entitlements.plist, is what lets the process have this address range)
@@ -109,11 +117,12 @@ __attribute__((section(".rst$z"), used)) static const ResetFn __stop_resets[1];
 void backend_reset(void);             // renderer: GPU idle, game textures and address-keyed caches dropped
 void backend_guest_memory_reset(void);  // renderer: guest memory was replaced (re-wrap the heap)
 void backend_clear_window(void);      // a black frame while the game is down
+void backend_quit(void);              // quitting: the render thread stopped, the GPU idle, caches kept (before exit())
 
 static void reboot_idle(void) {  // (main thread, while guest threads stop) keep the window alive
     SDL_Event e;
     while (SDL_PollEvent(&e))
-        if (e.type == SDL_EVENT_QUIT) { LOG("window closed\n"); exit(0); }
+        if (e.type == SDL_EVENT_QUIT) { LOG("window closed\n"); backend_quit(); exit(0); }
 }
 
 static void teardown(void) {
@@ -141,7 +150,17 @@ static void boot(const char *root) {
     snprintf(npdm_path, sizeof npdm_path, "%s/main.npdm", exefs);
     if (!g_romfs_dir) g_romfs_dir = strdup(romfs);
 
+#ifdef __linux__
+    {   // the window and graphics device first (normally made by the start screen or ui_run), so the guest heap can be
+        // the driver's memory before any game thread runs (runtime/nvn/vulkan/exec.c backend_guest_heap_prepare)
+        extern void ui_window_init(void);
+        extern void backend_guest_heap_prepare(void);
+        ui_window_init();
+        backend_guest_heap_prepare();
+    }
+#endif
     char why[512];
+    if (!game_version_select(root, why, sizeof why)) FATAL("%s\n", why);  // (the address table: game_addresses.h)
     // The game code: the library built from the game files, or - where none can be built or loaded (iOS), or with
     // LARECOMP_INTERP=1 - the interpreter (runtime/interp.c), which runs the game's own code directly.
     bool use_interp = getenv("LARECOMP_INTERP") && *getenv("LARECOMP_INTERP") == '1';
@@ -184,15 +203,51 @@ static void boot(const char *root) {
     kernel_run_main(t, t->handle, 0, init_fn, fini_fn);  // nn::init::Start(thread_handle, args_region, init, fini)
 }
 
+// The log's first line after the log's own: this build and the machine, for bug reports. Nothing that identifies the
+// player (platform.h plat_system_info). Once per session: a restart of this process (the start screen re-executing
+// itself for the game) appends to the same log and inherits LASRECOMP_INFO_LOGGED.
+static void log_startup_info(void) {
+    if (getenv("LASRECOMP_INFO_LOGGED")) return;
+    setenv("LASRECOMP_INFO_LOGGED", "1", 1);
+    extern const char *larecomp_version(void);  // runtime/ui/launcher.mm
+    PlatSysInfo si = {0};
+    plat_system_info(&si);
+    char cores[96] = "";
+    if (si.cores > 0) {
+        int n = snprintf(cores, sizeof cores, " %d cores", si.cores);
+        if (si.cores_detail[0]) n += snprintf(cores + n, sizeof cores - n, " (%s)", si.cores_detail);
+        if (si.threads > si.cores) snprintf(cores + n, sizeof cores - n, " / %d threads", si.threads);
+    } else if (si.threads > 0) snprintf(cores, sizeof cores, " %d threads", si.threads);
+    unsigned long long tenths = (si.ram * 10 + (1ull << 29)) >> 30;  // (GB to a tenth; whole when it is: 64 GB, 14.5 GB)
+    char ram[32] = "RAM unknown";
+    if (si.ram && tenths % 10) snprintf(ram, sizeof ram, "%llu.%llu GB RAM", tenths / 10, tenths % 10);
+    else if (si.ram) snprintf(ram, sizeof ram, "%llu GB RAM", tenths / 10);
+    fprintf(stderr, "[info] LAS Recomp %s, %s, %s%s, %s%s%s\n", larecomp_version(), si.os[0] ? si.os : "unknown OS",
+            si.cpu[0] ? si.cpu : "unknown CPU", cores, ram, si.package ? ", " : "", si.package ? si.package : "");
+}
+
 int main(int argc, char **argv) {
     plat_init();
+    log_startup_info();
+    if (getenv("LARECOMP_REEXEC")) {  // (reserve_guest_space started this process again)
+        const char *why = getenv("LARECOMP_REEXEC_WHY"), *n = getenv("LARECOMP_REEXEC");
+        if (!why) LOG("[boot] started again (try %s) (LARECOMP_REEXEC set by the caller)\n", n);
+        else if (!strcmp(why, REEXEC_FORCED)) LOG("[boot] started again (try %s): %s\n", n, why);
+        else LOG("[boot] started again (try %s): the guest address range was in use%s%s\n", n, *why ? ": " : "", why);
+    }
 #ifdef _WIN32
     setvbuf(stderr, NULL, _IONBF, 0);  // the Windows CRT treats _IOLBF as full buffering
 #else
     setvbuf(stderr, NULL, _IOLBF, 0);
 #endif
     const char *root = "extracted";  // (in the data root)
-    bool skip_launcher = getenv("LARECOMP_NO_LAUNCHER") || getenv("LARECOMP_INPUT");  // tests boot straight in
+    // LARECOMP_NO_LAUNCHER=1 (tools/game_slot.sh sets it for every test run): never the start screen - it can
+    // delete game files, and a test's extracted/ may be a link to someone else's. Where it would come up (a forced
+    // start screen, "Title screen" in game) the app exits instead. =0: off (start screen tests, scratch data root).
+    const char *nl = getenv("LARECOMP_NO_LAUNCHER");
+    bool no_launcher = nl && *nl && strcmp(nl, "0");
+    bool skip_launcher = no_launcher || getenv("LARECOMP_INPUT");  // tests boot straight in
+    if (getenv("LARECOMP_FORCE_LAUNCHER")) skip_launcher = false;  // (test: the start screen, then the scripted input)
     static char arg_root[1024];
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--play")) skip_launcher = true;
@@ -211,6 +266,10 @@ int main(int argc, char **argv) {
     }
 #endif
     for (bool title = !skip_launcher;;) {
+        if (title && no_launcher) {
+            fprintf(stderr, "[main] LARECOMP_NO_LAUNCHER is set: not showing the start screen - exiting\n");
+            exit(3);
+        }
         if (title) {  // start screen (runtime/ui/launcher.mm): game files setup, seed choice, settings
             extern void launcher_run(const char *root);
             launcher_run(root);

@@ -1,21 +1,25 @@
 # LAS Recomp on Linux (x86-64, aarch64)
 
-Status: branch `linux-beta2`. Builds and runs the game on Vulkan (with your own game files) on x86-64, checked before
+Status: builds and runs the game on Vulkan (with your own game files) on x86-64, checked before
 each release by `make smoketest`. aarch64 is **experimental**: cross-compiled, its start screen checked under emulation,
 the game itself untested on real hardware - community reports decide (see the end). `make appimage` / `make appimages`
 package the release AppImages.
 
 ## Running the AppImage
-    chmod +x LAS.Recomp-beta_4-linux-x86_64.AppImage
-    ./LAS.Recomp-beta_4-linux-x86_64.AppImage
+    chmod +x LAS.Recomp-<version>-linux-x86_64.AppImage
+    ./LAS.Recomp-<version>-linux-x86_64.AppImage
 
 Needs: a distribution with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36, Arch, ...), a Vulkan 1.3 driver
 (Mesa RADV / ANV / NVK / Turnip / Asahi Honeykrisp, or NVIDIA's), and on x86-64 a CPU with AVX2 (2013 or newer).
+On Linux 6.7 or newer the renderer also gets page write tracking (userfaultfd + PAGEMAP_SCAN, as Windows' write watch):
+its vertex cache, and textures re-checked only where the game wrote. Older kernels run without it (the log says
+`[plat] no page write tracking: ...`); `LARECOMP_WRITE_TRACKING=0` turns it off.
 The start screen asks for the folder with your own game files and sets them up.
 
 Everything the app writes lives in `~/.local/share/lasrecomp` (`$XDG_DATA_HOME/lasrecomp`): game files (`extracted/`),
 saves, seeds, settings (`larecomp.ini`), shader caches, imported fonts. Started without a terminal the log is
-`~/.local/share/lasrecomp/lasrecomp.log` (from a terminal it prints there instead). `LARECOMP_DATA_ROOT=<dir>` uses
+`~/.local/share/lasrecomp/lasrecomp.log`, always the latest run; up to five recent runs are kept as
+`lasrecomp-backup-*.log` (from a terminal it prints there instead). `LARECOMP_DATA_ROOT=<dir>` uses
 another folder.
 
 Controllers work as on the other systems (SDL3's gamepad support, bundled): Xbox, PlayStation (DualShock 4,
@@ -29,10 +33,16 @@ If the AppImage won't start with a FUSE error, install your distribution's `fuse
 needs `fusermount3`), or run it as `./LAS.Recomp-...-linux-x86_64.AppImage --appimage-extract-and-run`.
 
 ## Building from source
-Ubuntu / Debian packages (other distributions: the same libraries under their names; SDL3 3.2 or newer):
+Ubuntu / Debian packages (other distributions: the same libraries under their names). SDL3 must be 3.4 or newer
+(LAS Recomp loads and saves PNGs through it); where the distribution ships an older one (Debian 13 has 3.2), build SDL3
+3.4 from source first - `tools/linux/build_deps.sh` builds the pinned version the AppImage uses (into
+`build/linux/<arch>/deps`).
 
     sudo apt install clang lld make pkg-config python3-venv libsdl3-dev libavformat-dev libavcodec-dev \
         libavutil-dev libswscale-dev libvulkan-dev libshaderc-dev libvulkan-memory-allocator-dev glslc vulkan-tools
+
+shaderc is linked the way its pkg-config file says (`libshaderc_shared` on Arch, Fedora, AOSC...); to choose
+yourself: `make SHADERC=-lshaderc_shared` (or `-lshaderc`).
 
 Then from the repo root:
 
@@ -56,20 +66,23 @@ The randomizer from a source checkout uses LAS-Randomizer's own venv (Python 3.1
     third_party/LAS-Randomizer/venv/bin/pip install -r third_party/LAS-Randomizer/requirements.txt
 
 ## AppImages
-Needs podman, and for aarch64 QEMU user emulation with binfmt (`sudo apt install podman qemu-user qemu-user-binfmt`).
+Needs podman, and for the other arch's AppImage QEMU user emulation with binfmt (`sudo apt install podman qemu-user
+qemu-user-binfmt`).
 
     make appimage                # this machine's arch -> build/dist/LAS Recomp-<version>-linux-<arch>.AppImage
-    make appimage ARCH=aarch64   # cross-compiled from x86-64
+    make appimage ARCH=aarch64   # on x86-64: cross-compiled
     make appimages               # both
 
 Everything is built in Ubuntu 22.04 containers (`tools/linux/Containerfile`), so the result runs on glibc 2.35+:
 SDL3, an LGPL-only FFmpeg (only the movie codecs, as on Windows / macOS), and shaderc from pinned sources
-(`tools/linux/build_deps.sh`), then the game against them (`tools/linux/package.sh`). aarch64 is cross-compiled in
-the amd64 container against the arm64 image's root filesystem (`build/linux/aarch64/sysroot`). The seed generator
-helper (`tools/linux/rando_helper.sh`, PyInstaller) is frozen in a container of its own arch; on arm64 that runs
-under QEMU and builds oead and keystone-engine from source the first time (no arm64 wheels on PyPI; cached in
-`build/linux/aarch64/wheels`). The generated game code comes from the host (`generated/`, `generated-aarch64/`;
-`make appimage` runs `make gen` for it when missing).
+(`tools/linux/build_deps.sh`), then the game against them (`tools/linux/package.sh`). This machine's arch is built
+natively in one container of that arch (the release does both archs that way, on an arm64 runner for aarch64).
+aarch64 on an x86-64 machine is cross-compiled in the amd64 container against the arm64 image's root filesystem
+(`build/linux/aarch64/sysroot`), with only the seed generator helper (`tools/linux/rando_helper.sh`, PyInstaller
+builds for the machine it runs on) frozen in the arm64 container under QEMU, where pip also builds oead and
+keystone-engine from source the first time (no arm64 wheels on PyPI; cached in `build/linux/aarch64/wheels`). The
+generated game code comes from the host (`generated/`, `generated-aarch64/`; `make appimage` runs `make gen` for it
+when missing).
 
 Release check of the x86-64 AppImage (`make smoketest`, tools/linux/smoketest.sh, ~7 minutes on this kind of machine):
 three launches of the AppImage itself - the start screen; a session from a test save warping to four overworld spots
@@ -88,8 +101,10 @@ files or fonts.
   read/write mapping (`MAP_NORESERVE`), crashes are caught with `sigaction` on an alternate stack.
 - The HLE / service / reset tables are ELF sections found through the linker's `__start_` / `__stop_` symbols.
 - Renderer: the Windows Vulkan backend unchanged.
-- Without the user's Switch fonts the game text uses DejaVu Sans (TrueType; the game's font engine can't use CFF
-  fonts such as Noto Sans CJK).
+- Without the user's Switch fonts the game text uses the bundled BIZ UDPGothic (`third_party/fonts/BIZUDPGothic`),
+  sized like the console's font, where macOS / Windows use Hiragino / Yu Gothic; the in-game menu and button letters
+  use DejaVu Sans, the system's or the bundled copy (`third_party/fonts/DejaVu`). TrueType is required; the game's font
+  engine can't use CFF fonts such as Noto Sans CJK.
 - Pages: 4K and 16K kernels (Asahi) work; 64K-page kernels (some ARM servers) are not supported.
 
 ## Testing on ARM (aarch64): what to report
@@ -102,10 +117,11 @@ The aarch64 AppImage is experimental: built on x86-64, only its start screen has
 3. **What happened**: start screen? extraction? in game? where it stopped, any visual problems (screenshots help).
    With a controller: its model, and whether it works (the log names it: `[input] gamepad: ...`).
 4. **The log**: `~/.local/share/lasrecomp/lasrecomp.log` (or the terminal output when started from a terminal).
-   A crash writes `*** signal ...` and a backtrace there; attach the whole file.
+   A crash writes `*** signal ...` and a backtrace there; attach the whole file (or if the problem was in
+   an earlier run, that run's `lasrecomp-backup-*.log`, by date modified).
 5. **A crash backtrace with gdb** when the log's isn't enough:
 
-       ./LAS.Recomp-beta_4-linux-aarch64.AppImage --appimage-extract    # -> squashfs-root/
+       ./LAS.Recomp-<version>-linux-aarch64.AppImage --appimage-extract    # -> squashfs-root/
        cd ~/.local/share/lasrecomp
        gdb -batch -ex 'handle SIGSEGV nostop noprint pass' -ex run -ex 'thread apply all bt 20' \
            --args ~/squashfs-root/usr/bin/lasrecomp > gdb.txt 2>&1

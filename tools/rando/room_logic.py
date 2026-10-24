@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Item logic for shuffled dungeons (Dungeon room shuffle: Coherent / Chaos, tools/rando/dungeon_gen.py).
+"""Item logic for shuffled dungeons (Dungeon room shuffle: Coupled / Decoupled, tools/rando/dungeon_gen.py).
 
 LAS's dungeon logic describes the vanilla layouts: a few "room" regions per dungeon named after cells (D1-8D,
 D1-6F...) and each check gated by one of them plus key counts and what the check itself needs. With rooms moved
 that no longer holds, so for every shuffled dungeon this module builds the logic from the generated layout:
 
   graph      cells of the layout; edges = doorways that connect (neighbours whose doorways line up, door jumps -
-             Coherent and Chaos, directed for Chaos), plus the stairs links (side-view passages; stairs rooms are
+             directed), plus the stairs links (side-view passages; stairs rooms are
              anchors and never move)
   doors      only a room's OWN door actors count (a "(mirror)" door stood in the old neighbour, which isn't there):
              lock -> the dungeon's small keys, boss door -> its Nightmare Key, cracked wall -> bombs, shutter ->
@@ -19,7 +19,7 @@ that no longer holds, so for every shuffled dungeon this module builds the logic
              as a fixed point in minimal sum-of-products form (LAS evaluates conditions recursively, so cyclic
              region references aren't possible - the finished, loop-free condition goes into the logic)
   regions    LAS's cell regions (Dn-XY) are redefined as "reach cell XY of the new layout" (macros elsewhere use them)
-  checks     reach any cell holding the check's room (Coherent duplicates count, also in other dungeons) AND what
+  checks     reach the cell holding the check's room AND what
              the check needs inside its room: its vanilla condition with the region / key tokens taken out (where
              such a token sat inside an OR, the OR becomes an AND - stricter, never weaker). A check whose room isn't
              used anywhere is excluded (junk). Dungeon items go to the dungeon a check physically is in now.
@@ -358,12 +358,7 @@ def level_graph(cat, romfs, level, layout, jump_rows, openings):
         if row[0] != level:
             continue
         cell, side, own = row[1], row[2], int(row[3])
-        if len(row) > 6:  # Chaos: (level, cell, side, own, partner, tcell, tside, ...)
-            target = row[5]
-        else:  # Coherent jump: to the neighbour
-            c, r = cell_pos(cell)
-            dc, dr = STEP[side]
-            target = pos.get((c + dc, r + dr))
+        target = row[5]  # (level, cell, side, own, partner, tcell, tside, ...)
         jumped.add((cell, side, own))
         if target not in layout:
             continue
@@ -602,6 +597,9 @@ def apply(cat, romfs, layouts, jump_rows, logic_defs, item_defs, settings, extra
     excluded = settings.setdefault('excluded-locations', set())
     absent = settings.setdefault('absent-locations', set())  # (their rooms aren't in the layout: not in the game)
     rewritten = unused = fallback = 0
+    # dungeons with a crystal switch somewhere in their layout
+    crystal = {lv: any('ObjCrystalSw' in cat.get(r, {}).get('actors', ()) for r in layout.values())
+               for lv, layout in layouts.items()}
     targets = {k: (v.get('room'), v.get('level')) for k, v in lr.items()}
     for k, room in (extra_locations or {}).items():
         targets[k] = (room, room.rsplit('_', 1)[0])
@@ -659,6 +657,12 @@ def apply(cat, romfs, layouts, jump_rows, logic_defs, item_defs, settings, extra
             unused += 1
             continue
         local, _ = strip(parse(cond), drop)
+        lvl_now = next((p for p in places if LEVELS[p[0]][0] == home), places[0])[0]
+        if 'hit-crystal-switch' in cond and not crystal.get(lvl_now):
+            # (crystal blocks guard it, and the dungeon it's in now has no crystal switch to lower them)
+            excluded.add(loc), absent.add(loc)
+            unused += 1
+            continue
         r = reach[0] if len(reach) == 1 else ' | '.join(f'({x})' for x in reach)
         v['condition-basic'] = f'({r}) & ({show(local)})' if local else r
         for key in ('condition-advanced', 'condition-glitched', 'condition-hell'):
@@ -708,7 +712,7 @@ def apply(cat, romfs, layouts, jump_rows, logic_defs, item_defs, settings, extra
 
 
 def boss_door_ok(cat, romfs, level, layout, rows):
-    """The generator's check (Coherent / Chaos): without passing a boss door, every cell is reachable except the boss
+    """The generator's check (Coupled / Decoupled): without passing a boss door, every cell is reachable except the boss
     arena and the instrument room (DevRL_chaos_off: Turtle Rock's entrance was paired straight into the room before
     the boss door - the whole dungeon sat behind the Nightmare Key). layout: dungeon_gen's ({'Lv.._08D': room})."""
     import dungeon_gen

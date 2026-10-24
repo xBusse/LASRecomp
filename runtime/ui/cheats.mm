@@ -1,5 +1,6 @@
 // Cheats tab: toggles applied to the live save every frame while a save is loaded (layout: notes/save_format.md),
 // plus one-shot buttons. Settings persist in larecomp.ini (g_settings.cheat_*).
+#include "../game_addresses.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,8 +14,8 @@ extern "C" {
 int game_in_play(void);
 }
 
-#define LIVE_SAVE 0x7001CBB220ull  // main + 0x1CBB220
-template <typename T> static T &F(uint32_t off) { return *(T *)(uintptr_t)(LIVE_SAVE + off); }
+// GA(LIVE_SAVE): main + 0x1CBB220
+template <typename T> static T &F(uint32_t off) { return *(T *)(uintptr_t)(GA(LIVE_SAVE) + off); }
 
 enum : uint32_t {
     RUPEES = 0x5540, HP = 0x5544, PIECES = 0x5550, CONTAINERS = 0x5558, UPGRADES = 0x555C, BOMBS = 0x555E,
@@ -23,6 +24,12 @@ enum : uint32_t {
 
 static int max_hp(void) {  // quarter-hearts, as GetMaxHealth() computes it
     return 12 + 4 * (__builtin_popcount(F<uint16_t>(CONTAINERS) & 0x1FF) + __builtin_popcountll(F<uint64_t>(PIECES)) / 4);
+}
+
+// Link's health and its maximum, in quarter-hearts (controller light: runtime/hle/input.c). Only while game_in_play().
+extern "C" int cheats_link_health(int *max) {
+    *max = max_hp();
+    return F<int16_t>(HP);
 }
 
 static void fill_ammo(uint32_t count_off, int item_bit, int up_bit, int base_cap) {

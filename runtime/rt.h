@@ -1,14 +1,29 @@
 // Runtime-internal declarations.
 #pragma once
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 
 #include "cpu.h"
 #include "platform.h"
 
-#define LOG(...) fprintf(stderr, __VA_ARGS__)
-#define FATAL(...) (fprintf(stderr, "FATAL: " __VA_ARGS__), rt_fatal_trace())
+// One write per line: stderr is unbuffered (main.c / platform: crash logs aren't lost), and Windows' CRT then wrote a
+// formatted line as dozens of separate WriteFile calls - the 2-second stats line cost ~40 ms, a hitch every 2 s.
+static inline void __attribute__((format(printf, 1, 2))) rt_log(const char *fmt, ...) {
+    char b[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if ((size_t)n < sizeof b) { fwrite(b, 1, (size_t)n, stderr); return; }
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);  // (longer: as before)
+    va_end(ap);
+}
+#define LOG(...) rt_log(__VA_ARGS__)
+#define FATAL(...) (rt_fatal_msg(__VA_ARGS__), rt_fatal_trace())  // (runtime/crash_explain.c keeps the line)
 
 // ---- address space layout (guest addresses == host addresses)
 // macOS reserves 0x2_0000_0000-0x70_0000_0000, and guest addresses must fit in 39 bits, so the
@@ -51,6 +66,11 @@ uint64_t hle_register(const char *name, HostFn fn);  // returns fake guest addre
 HostFn hle_lookup_impl(const char *name);
 void hle_override(uint64_t guest_addr, HostFn fn, const char *name);
 void rt_fatal_trace(void) __attribute__((noreturn));
+// runtime/crash_explain.c: the fatal line / crash spot, and the player's explanation of it (the crash dialog)
+void rt_fatal_msg(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void rt_crash_fault(const char *what, uint64_t fa, uint64_t pc);
+void rt_crash_explain(char *out, size_t n, const char *log_path);
+extern int rt_romfs_files;
 void crash_handler_install(void);  // per thread (alternate signal stack)
 
 // ---- kernel.c

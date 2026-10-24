@@ -8,6 +8,7 @@
 // R registers itself with its parent while a level loads (`str xR, [x8, #0x1c0]` at main+0x80c464 /
 // main+0x80d718); tools/patches.py hooks those stores to tell us where R is. A warp then writes the same
 // fields main+0x81b950 writes, from the presenter's per-frame callback.
+#include "../game_addresses.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -23,16 +24,34 @@ static volatile uint64_t g_request;
 
 static uint64_t g_req;  // our level-jump request (HLE heap)
 static volatile int g_give_pending;
+// A warp waits for the one before it (issue #41: a jump handed to the game while its last one was still under way
+// crashed in its request processor, null+0x3f8): every level load registers a new request object (g_loads); after a
+// warp the next one waits for that load (or WARP_TIMEOUT frames), then WARP_SETTLE frames after any load.
+enum { WARP_SETTLE = 60, WARP_TIMEOUT = 900 };
+static volatile unsigned g_loads;
+static volatile uint64_t g_frame_now, g_load_frame;
+static unsigned g_loads_at_warp;
+static uint64_t g_warp_frame;
+static int g_warp_waiting;
+static int g_change;  // a level change of the game's own is under way (watch_level_change)
 RT_ON_RESET(warp_reset) {  // (reboot: nothing queued; the request objects were in the wiped memory)
     g_pending = 0;
     g_request = 0;
     g_req = 0;
     g_give_pending = 0;
+    g_warp_waiting = 0;
+    g_change = 0;
 }
 
 // Called from the generated code when a level registers its request object.
 void rt_warp_request_obj(uint64_t r) {
-    if (r != g_request) LOG("[warp] level-jump request object %llx\n", (unsigned long long)r);
+    if (r != g_request) {
+        LOG("[warp] level-jump request object %llx\n", (unsigned long long)r);
+        g_loads++;
+        g_load_frame = g_frame_now;
+        { extern void pace_hitch(const char *why);  // nvn/pace.c
+          pace_hitch("a level load"); }
+    }
     g_request = r;
 }
 
@@ -71,7 +90,7 @@ int g_start_screen;  // runtime/ui/launcher.mm: the start screen is up - before 
 
 int game_in_play(void) {
     if (g_start_screen) return 0;
-    uint64_t gm = LD64(MAIN_BASE + 0x1c97188);
+    uint64_t gm = LD64(GA(GAME_MGR));
     return gm && LD64(gm + 0x4b8) != 0;
 }
 
@@ -87,7 +106,7 @@ bool warp_blocked(const char *locator) {
     static const char *const kSwim[] = {"Field_03O", "Field_15K", "Field_03K", "EagleTowerExit_01A_b",  // WaterTopOutForward
                                         "FishingBoat_01A", "MamboCave_01A"};  // WaterSideOutLeft / Right (swim in)
     for (size_t i = 0; i < sizeof kSwim / sizeof kSwim[0]; i++)
-        if (!strcmp(locator, kSwim[i])) return !(LD32(MAIN_BASE + 0x1CBB220 + 0x556C) & 1);
+        if (!strcmp(locator, kSwim[i])) return !(LD32(GA(LIVE_SAVE) + 0x556C) & 1);
     return false;
 }
 int warp_busy(void) { return g_pending; }  // a queued warp not applied yet (shader tour)
@@ -120,7 +139,7 @@ static void warp_test(uint64_t frame) {
     if (next) next++;
 }
 
-#define PROCESS_REQUEST (MAIN_BASE + 0x81ba80)  // performs a pending level-jump request (x0 = request)
+// GA(LEVEL_REQUEST_SITE): performs a pending level-jump request (x0 = request)
 
 // LARECOMP_DUMP_MEM=<frame>:<main offset>:<deref offsets, '+'-separated or ->:<bytes>  e.g. 4400:1cb9fb8:0+8:0x2000
 // -> build/memdump.bin (test hook: [[main+off]+0]+8 ...)
@@ -148,33 +167,121 @@ static void mem_dump_test(uint64_t frame) {
     LOG("[memdump] frame %llu addr %llx bytes %zu\n", (unsigned long long)frame, (unsigned long long)p, n);
 }
 
+// LARECOMP_TEST_CRASH=<frame>:<segv|terminate|fatal> (test): stop the way those crashes do, for the crash dialog's
+// explanations (runtime/crash_explain.c) - segv: a game-memory read at 0; terminate: the uncaught-exception line
+static void crash_test(uint64_t frame) {
+    static const char *e;
+    static int init;
+    if (!init) init = 1, e = getenv("LARECOMP_TEST_CRASH");
+    if (!e || (uint64_t)strtoull(e, NULL, 10) != frame) return;
+    const char *k = strchr(e, ':');
+    k = k ? k + 1 : "";
+    if (!strcmp(k, "terminate")) FATAL("no function at 0 (lr=70044c7380 _ZSt13get_terminatev+20)\n");
+    if (!strcmp(k, "fatal")) FATAL("test fatal error\n");
+    volatile uint64_t *p = NULL;
+    (void)*p;
+}
+
+// LARECOMP_SHOTS=<frame>,<frame>,... (test): a screenshot at each of those frames, build/shots_<SHOT_ID>_<frame>.png
+// (one run, a filmstrip: a fight, an animation)
+static void shots_test(uint64_t frame) {
+    static const char *e;
+    static int init;
+    if (!init) init = 1, e = getenv("LARECOMP_SHOTS");
+    if (!e) return;
+    for (const char *p = e; *p; ) {
+        if ((uint64_t)strtoull(p, NULL, 10) == frame) {
+            extern char g_window_shot_request[256];  // runtime/hle/hookshot.c
+            const char *id = getenv("SHOT_ID");
+            snprintf(g_window_shot_request, sizeof g_window_shot_request, "build/shots_%s_%llu.png", id ? id : "x",
+                     (unsigned long long)frame);
+            return;
+        }
+        const char *c = strchr(p, ',');
+        if (!c) break;
+        p = c + 1;
+    }
+}
+
 void warp_frame(uint64_t frame) {
+    g_frame_now = frame;
+    crash_test(frame);
+    shots_test(frame);
     { extern void shader_tour_tick(uint64_t); shader_tour_tick(frame); }
     warp_test(frame);
     warp_on_load(frame);
     mem_dump_test(frame);
     if (ENV("LARECOMP_LOG_WARPAVAIL") && frame % 300 == 0) {
-        uint64_t gm = LD64(MAIN_BASE + 0x1c97188), ps = LD64(MAIN_BASE + 0x1cc1368);
+        uint64_t gm = LD64(GA(GAME_MGR)), ps = LD64(GA(PLAYER_STATUS_PTR));
         LOG("[warp] frame %llu gm %llx +4b8 %llx +4a8 %llx level '%s'\n", (unsigned long long)frame, (unsigned long long)gm,
             gm ? (unsigned long long)LD64(gm + 0x4b8) : 0, gm ? (unsigned long long)LD64(gm + 0x4a8) : 0,
             ps ? (const char *)(uintptr_t)ps : "");
     }
     if (ENV("LARECOMP_LOG_KEYITEMS") && frame % 120 == 0) {  // PlayerStatus key items vs the save buffer copy
-        uint64_t ps = LD64(MAIN_BASE + 0x1cc1368);
+        uint64_t ps = LD64(GA(PLAYER_STATUS_PTR));
         LOG("[keyitems] frame %llu ps %llx ps+ac %08x save+556c %08x\n", (unsigned long long)frame, (unsigned long long)ps,
-            ps ? *(uint32_t *)(uintptr_t)(ps + 0xac) : 0, *(uint32_t *)(uintptr_t)(0x7001CBB220ull + 0x556c));
+            ps ? *(uint32_t *)(uintptr_t)(ps + 0xac) : 0, *(uint32_t *)(uintptr_t)(GA(LIVE_SAVE) + 0x556c));
     }
+}
+
+// A level or area change of the game's own under way (Link walked through a doorway or into another area, or a warp
+// point fired): from the moment it starts, the request object the level registered (g_request) holds the destination
+// - level name +0xa8 / length +0xe8, locator +0xf0 / length +0x130 (the field the processor tests) - until the next
+// level registers a new, empty one. Once that change starts, the processor (main+0x81ba80) soon finds no player
+// component either - entity [gm+0x4a8], its object [entity+0x88], the component [object+0x618] (main+0x1b730 /
+// main+0x11b70, type-checked shared_ptrs: null when missing) - and calls main+0x864d50 with it unchecked: null+0x3f8,
+// the crash at return address main+0x81bdc8 (Field warps fired while Link walked into the Animal Village entrance or
+// the Mad Batter's well). A warp handed over while the component was still there didn't crash but was lost (the
+// game's own change won). So a warp waits while the request object holds a destination - checked every frame and
+// remembered until the next level's request object registers (the old one is freed during the load; a stale one
+// left over without a successor holds garbage, not a destination), at most CHANGE_TIMEOUT frames - and while there is
+// no player component; then WARP_SETTLE frames after the new level's request object, as after any load.
+enum { CHANGE_TIMEOUT = 600 };
+static unsigned g_change_loads;       // g_loads when the game's own change was last seen pending
+static uint64_t g_change_req, g_change_since;
+static char g_change_level[64];        // its destination (log)
+static int g_deferred_log;
+static void watch_level_change(uint64_t now) {
+    uint64_t r = g_request;
+    uint64_t ll = r ? LD64(r + 0xe8) : 0, lc = r ? LD64(r + 0x130) : 0;
+    if (ll && ll < 0x40 && lc && lc < 0x40 && strnlen((const char *)(uintptr_t)(r + 0xa8), 0x40) == ll &&
+        strnlen((const char *)(uintptr_t)(r + 0xf0), 0x40) == lc) {  // a destination
+        if (!g_change || r != g_change_req) g_change_since = now;
+        g_change = 1, g_change_req = r, g_change_loads = g_loads;
+        strlcpy(g_change_level, (const char *)(uintptr_t)(r + 0xf0), sizeof g_change_level);
+    } else if (g_change && g_loads != g_change_loads) {
+        g_change = 0;  // (the next level registered its request object)
+    }
+    if (g_change && now - g_change_since > CHANGE_TIMEOUT) g_change = 0;
+}
+static int player_component_missing(void) {
+    uint64_t gm = LD64(GA(GAME_MGR)), e = gm ? LD64(gm + 0x4a8) : 0, o = e ? LD64(e + 0x88) : 0;
+    return !o || !LD64(o + 0x618);
 }
 
 // Game main thread, once per frame (from the controller read): if a warp is queued, build a request with
 // the fields main+0x81b950 fills and hand it to the game's own request processor.
 void warp_game_tick(Cpu *c) {
+    uint64_t now = g_frame_now;
+    watch_level_change(now);
     if (!g_pending) return;
+    if (g_warp_waiting && g_loads == g_loads_at_warp && now - g_warp_frame < WARP_TIMEOUT)
+        return;  // (the last warp's level isn't loaded yet: this one stays queued)
+    g_warp_waiting = 0;
     if (!game_in_play()) {  // requested from the title screen etc.: drop it (jumping there crashes the game)
         g_pending = 0;
         LOG("[warp] ignored: not in a game\n");
         return;
     }
+    if (now - g_load_frame < WARP_SETTLE) return;  // (a level just loaded: let it settle first)
+    if (g_change || player_component_missing()) {  // (the game's own level / area change: stays queued until done)
+        if (!g_deferred_log)
+            LOG("[warp] waiting: a level change of the game's own is under way (%s)\n",
+                g_change ? g_change_level : "no player component");
+        g_deferred_log = 1;
+        return;
+    }
+    g_deferred_log = 0;
     if (!g_req) g_req = (uint64_t)(uintptr_t)hle_alloc(0x200);
     uint64_t req = g_req;
     pthread_mutex_lock(&g_lock);
@@ -187,10 +294,11 @@ void warp_game_tick(Cpu *c) {
     g_pending = 0;
     pthread_mutex_unlock(&g_lock);
     LOG("[warp] jumping to %s / %s\n", (char *)(uintptr_t)(req + 0xa8), (char *)(uintptr_t)(req + 0xf0));
+    g_warp_waiting = 1, g_loads_at_warp = g_loads, g_warp_frame = now;
     uint64_t saved[31], sp = c->sp, pc = c->pc;
     memcpy(saved, c->x, sizeof saved);
     c->x[0] = req;
-    guest_call(c, PROCESS_REQUEST);
+    guest_call(c, GA(LEVEL_REQUEST_SITE));
     memcpy(c->x, saved, sizeof saved);
     c->sp = sp;
     c->pc = pc;
@@ -198,7 +306,7 @@ void warp_game_tick(Cpu *c) {
 
 // ---- give item (game thread): main+0x7e18b0 = AddItem(itemId, count, index, autoEquip), the call behind the
 // Inventory.AddItemByKey event action (itemId = row of datasheets/Items.gsheet, e.g. 78 PanelDungeonPiece).
-#define ADD_ITEM (MAIN_BASE + 0x7e18b0)
+
 static int g_give_id, g_give_count, g_give_index;
 
 void give_item_request(int id, int count, int index) {
@@ -245,7 +353,7 @@ static void find_floats_tick(uint64_t frame) {
                             uint64_t v = *(volatile uint64_t *)(uintptr_t)(ra[r] + q), loc = ra[r] + q;
                             for (int t = 0; t < nl; t++)
                                 if (v <= lv[t] && v >= lv[t] - (depth ? 0x800 : 0x10)) {
-                                    bool gl = loc >= MAIN_BASE && loc < MAIN_BASE + 0x2000000;
+                                    bool gl = loc >= MAIN_BASE && loc < GA(MAIN_IMAGE_SCAN_END);
                                     LOG("[findfloats] path d%d %s%llx -> %llx (+%llx)\n", depth, gl ? "MAIN+" : "",
                                         (unsigned long long)(gl ? loc - MAIN_BASE : loc), (unsigned long long)v,
                                         (unsigned long long)(lv[t] - v));
@@ -503,7 +611,7 @@ static void memdump_tick(uint64_t frame) {
 }
 
 // LARECOMP_PANE_SCAN=<frame>:<hex addr>[:<depth>]: log UI panes reachable from an object (addr 0 = LARECOMP_FNPROF_BT's
-// x0, 1 = the dungeon map page) (RE: pane name at +0xB0,
+// x0, 1 = the dungeon map page, 2 = the overworld map page) (RE: pane name at +0xB0,
 // translate +0x30/+0x34, scale +0x48/+0x4C), following pointers up to <depth> levels (default 2)
 static void pane_scan_rec(uint64_t obj, int depth, const char *path, uint64_t *seen, int *nseen) {
     extern int kernel_data_regions(uint64_t *a, uint64_t *s, int max);
@@ -525,8 +633,10 @@ static void pane_scan_rec(uint64_t obj, int depth, const char *path, uint64_t *s
                             (nm[len] >= '0' && nm[len] <= '9') || nm[len] == '_')) len++;
         if (len >= 3 && nm[len] == 0 && nm[1] == '_') {
             const float *f = (const float *)(uintptr_t)p;
-            LOG("[pane] %s+%#x -> %llx '%s' t(%.1f, %.1f) s(%.3f, %.3f) size(%.1f, %.1f)\n", path, off, (unsigned long long)p, nm,
-                f[0x30 / 4], f[0x34 / 4], f[0x48 / 4], f[0x4C / 4], f[0x50 / 4], f[0x54 / 4]);
+            const uint8_t *fl = (const uint8_t *)(uintptr_t)(p + 0x58);
+            LOG("[pane] %s+%#x -> %llx '%s' t(%.1f, %.1f) s(%.3f, %.3f) size(%.1f, %.1f) +58 %02x %02x %02x %02x %02x %02x\n", path, off,
+                (unsigned long long)p, nm, f[0x30 / 4], f[0x34 / 4], f[0x48 / 4], f[0x4C / 4], f[0x50 / 4], f[0x54 / 4], fl[0], fl[1], fl[2],
+                fl[3], fl[4], fl[5]);
         }
         if (depth > 0) {
             char sub[256];
@@ -549,6 +659,7 @@ static void pane_scan_tick(uint64_t frame) {
     extern uint64_t g_bt_first_x0;  // fnprof.c: x0 of the first LARECOMP_FNPROF_BT function hit (addr 0 = use it)
     if (!addr) addr = g_bt_first_x0;
     if (addr == 1) { extern uint64_t chaos_dgnmap_obj(void); addr = chaos_dgnmap_obj(); }  // 1 = the dungeon map page
+    if (addr == 2) { extern uint64_t tracker_map_obj(void); addr = tracker_map_obj(); }  // 2 = the overworld map page
     LOG("[pane] scanning from %llx\n", (unsigned long long)addr);
     if (!addr) return;
     static uint64_t seen[4096];
@@ -621,13 +732,17 @@ void give_item_tick(Cpu *c, uint64_t frame) {
     actor_scan_tick(frame);
     { extern void miniboss_tick(Cpu *, uint64_t); miniboss_tick(c, frame); }
     { extern void escape_tick(Cpu *, uint64_t); escape_tick(c, frame); }
+    { extern void hint_sheet_tick(Cpu *, uint64_t); hint_sheet_tick(c, frame); }  // (runtime/hle/hint_sheet.c)
     { extern void rescue_tick(uint64_t); rescue_tick(frame); }  // (softlock rescues: runtime/hle/rescue.c)
     pane_scan_tick(frame);
     { extern void doorjump_tick(uint64_t frame); doorjump_tick(frame); }
-    { extern void pot_reveal_tick(uint64_t frame); pot_reveal_tick(frame); }  // (after doorjump: Link found)
+    { extern void pot_regrow_tick(uint64_t frame); pot_regrow_tick(frame); }  // (after doorjump: Link found)
     { extern void souls_tick(uint64_t frame); souls_tick(frame); }  // (boss / mini-boss souls: runtime/hle/souls.c)
+    { extern void triforce_tick(void); triforce_tick(); }  // (Triforce hunt: the get message's flags, triforce.c)
     { extern void hookshot_tour_tick(uint64_t frame); hookshot_tour_tick(frame); }
     { extern void flags_ext_tick(void); flags_ext_tick(); }  // (game thread: flag gets / sets happen here too)
+    { extern void rt_powder_flag_tick(void); rt_powder_flag_tick(); }  // (found powder: keysanity.c)
+    { extern void silent_pickups_tick(uint64_t); silent_pickups_tick(frame); }  // (a silent Heart Container's refill)
     ptrscan_tick(frame);
     memdump_tick(frame);
     find_move_tick(frame);
@@ -665,7 +780,7 @@ void give_item_tick(Cpu *c, uint64_t frame) {
                 uint64_t saved[31];
                 memcpy(saved, c->x, sizeof saved);
                 c->x[0] = (uint64_t)id; c->x[1] = (uint64_t)cnt; c->x[2] = (uint64_t)(int64_t)idx; c->x[3] = (uint64_t)equip;
-                guest_call(c, ADD_ITEM);
+                guest_call(c, GA(ADD_ITEM));
                 memcpy(c->x, saved, sizeof saved);
                 LOG("[give] item %d x%d (index %d)\n", id, cnt, idx);
             }
@@ -698,7 +813,7 @@ void give_item_tick(Cpu *c, uint64_t frame) {
         uint64_t saved[31];
         memcpy(saved, c->x, sizeof saved);
         c->x[0] = (uint64_t)g_give_id; c->x[1] = (uint64_t)g_give_count; c->x[2] = (uint64_t)(int64_t)g_give_index; c->x[3] = 0;
-        guest_call(c, ADD_ITEM);
+        guest_call(c, GA(ADD_ITEM));
         memcpy(c->x, saved, sizeof saved);
         LOG("[give] item %d x%d (index %d)\n", g_give_id, g_give_count, g_give_index);
     }
@@ -717,6 +832,21 @@ HLE_FUNC("_ZNKSt3__120__vector_base_commonILb1EE20__throw_out_of_rangeEv", rt_ve
         (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)c->x[8], (unsigned long long)c->x[9],
         (unsigned long long)c->x[19], (unsigned long long)c->x[20], (unsigned long long)c->x[21]);
     FATAL("vector::at out of range (see [oor] lines)\n");
+}
+
+// Any C++ exception the game throws ends the game here: recompiled code can't unwind to a catch, so a throw always
+// ended in std::terminate - "no function at <heap address> (lr=... get_terminate+20)", which says nothing about what
+// was thrown or where (issues #41, #60, #155: an empty event handler, caught by the game on the Switch; hooks.c skips
+// that call now). Name the exception (its type_info, x1) and the game code that threw it, then stop as before.
+HLE_FUNC("__cxa_throw", rt_cxa_throw) {
+    uint64_t ti = c->x[1], nm = ti >= GUEST_LO && ti < GUEST_HI ? LD64(ti + 8) : 0;  // (type_info: vtable, name)
+    nm &= ~(1ull << 63);  // (libc++ marks non-unique type names in bit 63)
+    const char *type = nm >= GUEST_LO && nm < GUEST_HI ? (const char *)(uintptr_t)nm : "?";
+    LOG("[throw] uncaught C++ exception %.80s thrown at %llx\n", type, (unsigned long long)c->x[30]);
+    uint64_t fp = c->x[29];
+    for (int i = 0; i < 12 && fp >= GUEST_LO && fp < GUEST_HI; i++, fp = LD64(fp))
+        LOG("[throw]   frame %d ret %llx\n", i, (unsigned long long)LD64(fp + 8));
+    FATAL("uncaught C++ exception %.80s thrown at %llx (see [throw] lines)\n", type, (unsigned long long)c->x[30]);
 }
 
 void rt_log_resname(uint64_t p) {

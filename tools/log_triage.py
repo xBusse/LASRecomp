@@ -75,7 +75,7 @@ def parse(text):
     lines = text.splitlines()
     r = {"backend": None, "gpu": None, "gpus": [], "api": None, "driver": None, "os": None, "cpu": None,
          "build": None, "settings": None, "swapchain": None, "integrated": False, "fps": [], "slow": [],
-         "notable": {}, "end": None, "end_line": None, "lines": len(lines)}
+         "notable": {}, "seed": None, "end": None, "end_line": None, "lines": len(lines)}
     fatal = exc = crash_head = None
     devlost = hang = closed = False
     for i, ln in enumerate(lines):
@@ -127,13 +127,15 @@ def parse(text):
             devlost = True
         elif ln.startswith("[hang] ====="):
             hang = True
+        elif m := re.match(r'^\[rando\] seed "([^"]+)" active(?:, seed ID (\S+))?', ln):
+            r["seed"] = m.group(1) + (f" (seed ID {m.group(2)})" if m.group(2) else "")
         elif ln.strip() == "window closed":
             closed = True
         for label, rx in NOTABLE:
             if rx.search(ln):
                 n, first = r["notable"].get(label, (0, ln))
                 r["notable"][label] = (n + 1, first)
-    if r["integrated"] or any("integrated GPU" in x for x in lines[:200]):
+    if r["integrated"] or any("integrated GPU" in x and "not an integrated GPU" not in x for x in lines[:200]):
         r["integrated"] = True
     if devlost:
         r["end"], r["end_line"] = "device-lost", fatal or "the GPU device was lost"
@@ -179,6 +181,7 @@ def summarise(r):
     else:
         out.append("- **GPU:** not in the log")
     out.append(f"- **Backend:** {r['backend'] or 'not in the log'}")
+    if r["seed"]: out.append(f"- **Randomizer seed:** {code(r['seed'], 120)}")
     st = []
     if r["settings"]: st.append(code(r["settings"], 120))
     if r["swapchain"]: st.append(f"window {r['swapchain']}")

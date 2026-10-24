@@ -4,6 +4,7 @@
 // The renderer asks pot_tint() for each draw whose shader supports the tint (runtime/nvn/maxwell/translate.c);
 // a draw is a pot when its model matrix (vertex UBO 2, 3x4 row-major) is unscaled and sits exactly on a pot
 // of the current level. The pot stays gold until its item's GlobalFlags bit is set.
+#include "../game_addresses.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,12 +14,12 @@
 #include "../platform.h"
 #include "../rando.h"
 
-#define PLAYER_STATUS_PTR (MAIN_BASE + 0x1CC1368)  // PlayerStatus*: current level name at +0
-#define EVENT_FLAGS (MAIN_BASE + 0x1CBB220 + 0x5DC0)  // live save: GlobalFlags bitfield (2048 bits)
+// GA(PLAYER_STATUS_PTR): PlayerStatus*: current level name at +0
+#define EVENT_FLAGS (GA(LIVE_SAVE) + 0x5DC0)  // live save: GlobalFlags bitfield (2048 bits)
 
-// bushes.tsv rows may add: cut flag, hidden item scale, full item scale, room file, item record offset in it
-// (see pot_reveal_tick)
-typedef struct { char level[40]; float x, y, z; int flag, cut; float small, full; char room[16]; int rec; } Pot;
+// bushes.tsv rows may add: cut flag, hidden item scale, full item scale, room file (and the item's record offset in it,
+// unused: see pot_regrow_tick)
+typedef struct { char level[40]; float x, y, z; int flag, cut; float small, full; char room[16]; } Pot;
 static Pot *g_pots;
 static int g_npots = -1;
 // gold = luminance remapped onto a gold ramp (keeps the pot's shading), plus a slow shimmer
@@ -43,9 +44,9 @@ static void load(void) {
         int n0 = g_npots;
         char line[256];
         while (fgets(line, sizeof line, f)) {
-            Pot p = {.cut = -1, .rec = -1};
-            if (sscanf(line, "%39s %f %f %f %d %d %f %f %15s %d", p.level, &p.x, &p.y, &p.z, &p.flag, &p.cut,
-                       &p.small, &p.full, p.room, &p.rec) < 5) continue;
+            Pot p = {.cut = -1};
+            if (sscanf(line, "%39s %f %f %f %d %d %f %f %15s", p.level, &p.x, &p.y, &p.z, &p.flag, &p.cut, &p.small,
+                       &p.full, p.room) < 5) continue;
             if (g_npots == cap) g_pots = realloc(g_pots, sizeof(Pot) * (cap = cap ? cap * 2 : 256));
             g_pots[g_npots++] = p;
         }
@@ -55,7 +56,7 @@ static void load(void) {
 }
 
 static const char *current_level(void) {
-    uint64_t ps = LD64(PLAYER_STATUS_PTR);
+    uint64_t ps = LD64(GA(PLAYER_STATUS_PTR));
     return ps ? (const char *)(uintptr_t)ps : "";
 }
 
@@ -162,87 +163,140 @@ bool pot_tint(const float *m, float tint[8], uint64_t mesh) {
     return false;
 }
 
-// Bushsanity: the item inside a bush is small so the leaves hide it, which left it near invisible once the bush was
-// cut (players walked past it and took the bush's random rupee instead). A bush with an item has a cut flag as its
-// switch 0 (tools/rando/bushes.py: the game sets it when the bush is cut, and keeps such a bush cut); once it's set
-// the item is shown full size: the item's actor record in the loaded room file (pos xyz, rotation xyz in degrees,
-// scale xyz) gets the full scale, used by every spawn in this level load. Bushes still grow back as in the game: once
-// Link is more than a screen away (or in another level) the cut flag is cleared and the record made small again, so
-// the bush is there on his next visit - gold until its item is taken, and cutting it shows the same item again.
-// Room files (.leb) sit whole at a page-aligned address, so the record is at a page starting with the .leb header +
-// the record's offset in the file (bushes.tsv), checked (position, hidden scale) before it's written: a pass over the
-// page starts of guest data, done only when the set of such items around Link changes (a bush cut, another screen).
-uint64_t doorjump_player(uint64_t frame);                         // runtime/hle/doorjump.c
-int kernel_data_regions(uint64_t *addr, uint64_t *size, int max);  // runtime/kernel.c
-#define LEB_MAGIC 0x0017013du  // first 4 bytes of every .leb (the next 4 change once the game has loaded it)
-static uint64_t g_reveal_sig = ~0ull;
-static int g_reveal_cell = -1;
-static uint64_t *g_rec;  // per item spot: where its record was patched (re-checked before it's trusted)
-RT_ON_RESET(pot_reveal_reset) {
-    free(g_rec);
-    g_rec = NULL;
-    g_reveal_sig = ~0ull;
-    g_reveal_cell = -1;
-}
+// Bushsanity: a bush with an item has a cut flag as its switch 0 (tools/rando/bushes.py: the game sets it when the bush
+// is cut, and keeps such a bush cut). Bushes still grow back as in the game: once Link is more than a screen away (or in
+// another level) the cut flag is cleared, so the bush is there on his next visit - gold until its item is taken, and
+// cutting it shows the same item again. (The item itself: rt_bush_item_skip / pot_bush_game_tick below. It comes full
+// size through the actor factory, so the room file's record of it is never patched: that took a pass over every page
+// of guest data on the game thread, 5-10 ms, at each cut - a one-frame hitch per bush.)
+uint64_t doorjump_player(uint64_t frame);  // runtime/hle/doorjump.c
+static int g_regrow_cell = -1;
+RT_ON_RESET(pot_regrow_reset) { g_regrow_cell = -1; }
 
-static bool rec_is(const Pot *p, uint64_t a, float s) {
-    const float *t = (const float *)(uintptr_t)a;
-    return a && t[0] == p->x && t[1] == p->y && t[2] == p->z && t[6] == s && t[7] == s && t[8] == s;
-}
-
-void pot_reveal_tick(uint64_t frame) {
+void pot_regrow_tick(uint64_t frame) {
     if (!pot_glow_active()) return;
     uint64_t pc = doorjump_player(frame);
     if (!pc) return;
-    if (!g_rec) g_rec = calloc((size_t)g_npots, sizeof *g_rec);
     const float *lp = (const float *)(uintptr_t)(pc + 0x80);
-    float lx = lp[0], lz = lp[2];
-    int cx = (int)floorf(lx / 15.0f), cz = (int)floorf(lz / 12.0f), cell = cx * 64 + cz, want[64], nw = 0;
+    int cx = (int)floorf(lp[0] / 15.0f), cz = (int)floorf(lp[2] / 12.0f), cell = cx * 64 + cz;
     static char level[40];
     bool new_level = strncmp(current_level(), level, sizeof level) != 0;
-    if (new_level || cell != g_reveal_cell) {  // bushes regrow (as in the game): Link left their screen
-        strlcpy(level, current_level(), sizeof level);
-        for (int i = 0; i < g_npots; i++) {
-            Pot *p = &g_pots[i];
-            if (p->cut < 0 || !flags_ext_get(p->cut)) continue;
-            if (!new_level && !strcmp(p->level, level) && abs((int)floorf(p->x / 15.0f) - cx) <= 1 &&
-                abs((int)floorf(p->z / 12.0f) - cz) <= 1) continue;  // (its room may still be loaded: next time)
-            flags_ext_clear(p->cut);
-            if (rec_is(p, g_rec[i], p->full)) {  // hidden in the bush again
-                float *t = (float *)(uintptr_t)g_rec[i];
-                t[6] = t[7] = t[8] = p->small;
-            }
-            g_rec[i] = 0;
-        }
+    if (!new_level && cell == g_regrow_cell) return;
+    g_regrow_cell = cell;  // bushes regrow (as in the game): Link left their screen
+    strlcpy(level, current_level(), sizeof level);
+    for (int i = 0; i < g_npots; i++) {
+        const Pot *p = &g_pots[i];
+        if (p->cut < 0 || !flags_ext_get(p->cut)) continue;
+        if (!new_level && !strcmp(p->level, level) && abs((int)floorf(p->x / 15.0f) - cx) <= 1 &&
+            abs((int)floorf(p->z / 12.0f) - cz) <= 1) continue;  // (its room may still be loaded: next time)
+        flags_ext_clear(p->cut);
     }
-    uint64_t sig = 1469598103934665603ull;
-    for (int k = 0; k < g_nlv && nw < 64; k++) {  // cut, unchecked items within a screen of Link
-        const Pot *p = &g_pots[g_lv_idx[k]];
-        if (p->cut < 0 || p->rec < 0 || fabsf(p->x - lx) > 16 || fabsf(p->z - lz) > 13) continue;
-        if (!flags_ext_get(p->cut) || !unchecked(p) || rec_is(p, g_rec[g_lv_idx[k]], p->full)) continue;
-        want[nw++] = g_lv_idx[k];
-        sig = (sig ^ (uint64_t)g_lv_idx[k]) * 1099511628211ull;
-    }
-    if (cell != g_reveal_cell) g_reveal_sig = ~0ull;  // (another screen: maybe newly loaded room files)
-    g_reveal_cell = cell;
-    if (!nw || sig == g_reveal_sig) return;
-    g_reveal_sig = sig;
-    uint64_t ra[64], rs[64], t0 = plat_now_ns();
-    int nr = kernel_data_regions(ra, rs, 64), done = 0;
-    for (int r = 0; r < nr; r++)
-        for (uint64_t a = (ra[r] + 0xFFF) & ~0xFFFull; a + 0x1000 <= ra[r] + rs[r]; a += 0x1000) {
-            if (*(const uint32_t *)(uintptr_t)a != LEB_MAGIC) continue;
-            for (int j = 0; j < nw; j++) {
-                const Pot *p = &g_pots[want[j]];
-                uint64_t rec = a + (uint64_t)p->rec;
-                if (rec + 36 > ra[r] + rs[r] || !rec_is(p, rec, p->small)) continue;
-                float *t = (float *)(uintptr_t)rec;
-                t[6] = t[7] = t[8] = p->full;
-                g_rec[want[j]] = rec;
-                done++;
-            }
+}
+
+// A bush's item only exists once the bush is cut. It used to stand hidden inside the bush, shrunk - but shrinking
+// doesn't shrink what Link touches to pick it up: pressed against the bush (from below, cutting the one next to it)
+// he took the item through the leaves. The gold bush then went green for an item that seemed to come out of another
+// bush, and that other bush stayed gold, its own item never taken (user reports, beta 5). Now the level's spawn of
+// the item is skipped while the bush stands (rt_bush_item_skip, from the actor factory hook in runtime/hle/souls.c)
+// and its spawn info kept; once the bush's cut flag is set the item is spawned into the bush's screen with it, full
+// size (pot_bush_game_tick). A bush cut when its room loads lets the item come with the room, full size.
+#define T_SINKING_SWORD 0x194
+#define BUSH_KEY_TAG 0x7Bu  // (tools/rando/bushes.py key_tag: the items' actor keys)
+#define SPAWN_INFO_SIZE 0x1c0  // spawn info: +0 key, +8 type, +0xc zone, +0x10 parameters, +0x180 position / rotation / scale
+static uint8_t **g_info;  // per spot: the skipped spawn of its item (bush not cut yet)
+static uint64_t *g_item;  // per spot: weak ref (control block) of the item we spawned
+static uint64_t g_spawn_scratch;
+RT_ON_RESET(pot_bush_reset) {  // (the infos and refs were the old boot's)
+    if (g_info)
+        for (int i = 0; i < g_npots; i++) free(g_info[i]);
+    free(g_info), free(g_item);
+    g_info = NULL, g_item = NULL;
+    g_spawn_scratch = 0;
+}
+
+bool rt_bush_item_skip(uint32_t type, uint64_t info) {
+    if (type != T_SINKING_SWORD || (LD64(info) >> 56) != BUSH_KEY_TAG) return false;
+    if (g_npots < 0) load();
+    if (g_npots <= 0) return false;
+    const float *pos = (const float *)(uintptr_t)(info + 0x180);
+    const char *lv = current_level();
+    for (int i = 0; i < g_npots; i++) {
+        Pot *p = &g_pots[i];
+        if (p->cut < 0 || p->x != pos[0] || p->y != pos[1] || p->z != pos[2] || strcmp(p->level, lv)) continue;
+        if (!g_info) g_info = calloc((size_t)g_npots, sizeof *g_info), g_item = calloc((size_t)g_npots, sizeof *g_item);
+        float *scale = (float *)(uintptr_t)(info + 0x180 + 0x20);
+        if (flags_ext_get(p->cut) || !unchecked(p)) {  // cut already (or taken): as the room has it, full size
+            if (unchecked(p)) scale[0] = scale[1] = scale[2] = p->full;
+            free(g_info[i]);
+            g_info[i] = NULL;
+            return false;
         }
-    LOG("[pots] %d cut bush item(s) around Link: %d shown full size (%.1f ms)\n", nw, done, (plat_now_ns() - t0) / 1e6);
+        if (!g_info[i]) g_info[i] = malloc(SPAWN_INFO_SIZE);
+        memcpy(g_info[i], (const void *)(uintptr_t)info, SPAWN_INFO_SIZE);
+        scale = (float *)(g_info[i] + 0x180 + 0x20);
+        scale[0] = scale[1] = scale[2] = p->full;
+        return true;
+    }
+    return false;
+}
+
+static bool weak_alive(uint64_t ctrl) { return ctrl && (int64_t)LD64(ctrl + 8) >= 0; }
+
+static void weak_drop(Cpu *c, uint64_t *slot) {
+    if (!*slot) return;
+    c->x[0] = *slot;
+    *slot = 0;
+    guest_call(c, GA(WEAK_RELEASE));
+}
+
+static bool spawn_bush_item(Cpu *c, int i) {
+    bool digs_screen_room(Cpu *c, uint64_t pair, int screen, uint64_t *sctrl);  // runtime/hle/digs.c
+    const Pot *p = &g_pots[i];
+    int row = 0;
+    char col = 0;
+    if (sscanf(p->room, "Field_%2d%c", &row, &col) != 2 || row < 1 || row > 16 || col < 'A' || col > 'P') return true;
+    if (!g_spawn_scratch) g_spawn_scratch = (uint64_t)(uintptr_t)hle_alloc(0x400);
+    uint64_t s = g_spawn_scratch, info = s + 0x40, sctrl;
+    memset((void *)(uintptr_t)s, 0, 0x400);
+    memcpy((void *)(uintptr_t)info, g_info[i], SPAWN_INFO_SIZE);
+    bool loaded = digs_screen_room(c, s + 0x10, (row - 1) * 16 + (col - 'A'), &sctrl);
+    if (loaded) {
+        c->x[0] = s;
+        c->x[1] = s + 0x10;
+        c->x[2] = info;
+        guest_call(c, GA(CREATE_ACTOR));
+        uint64_t ictrl = LD64(s + 8);
+        if (LD64(s) && ictrl) {
+            __atomic_fetch_add((int64_t *)(uintptr_t)(ictrl + 0x10), 1, __ATOMIC_ACQ_REL);  // (our weak ref)
+            g_item[i] = ictrl;
+            c->x[0] = ictrl;
+            guest_call(c, GA(SP_RELEASE));
+        }
+        LOG("[pots] bush %s cut: its item (flag %d) %s\n", p->room, p->flag, LD64(s) ? "spawned" : "failed to spawn");
+        { extern void pace_hitch(const char *why);  // nvn/pace.c
+          pace_hitch("an item spawn"); }
+    }
+    if (sctrl) { c->x[0] = sctrl; guest_call(c, GA(SP_RELEASE)); }
+    return loaded;
+}
+
+// game thread, once per frame (runtime/hle/input.c)
+void pot_bush_game_tick(Cpu *c, uint64_t frame) {
+    if (!g_info || frame % 4) return;
+    extern int game_in_play(void);
+    if (!game_in_play()) return;
+    uint64_t saved[31], sp = c->sp, pc = c->pc;
+    memcpy(saved, c->x, sizeof saved);
+    const char *lv = current_level();
+    for (int i = 0; i < g_npots; i++) {
+        if (g_item[i] && !weak_alive(g_item[i])) weak_drop(c, &g_item[i]);  // (picked up, or its room unloaded)
+        if (!g_info[i] || strcmp(g_pots[i].level, lv) || !flags_ext_get(g_pots[i].cut) || !unchecked(&g_pots[i])) continue;
+        if (g_item[i]) continue;
+        if (spawn_bush_item(c, i)) free(g_info[i]), g_info[i] = NULL;  // (once: a reload of the room keeps its own)
+    }
+    memcpy(c->x, saved, sizeof saved);
+    c->sp = sp;
+    c->pc = pc;
 }
 
 // The item that was out already when its bush was cut keeps the scale it spawned with: until the room is loaded again

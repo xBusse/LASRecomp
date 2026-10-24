@@ -388,6 +388,14 @@ class Module:
                     v = self.lifter.lift(w, a)
                     if v.kind in ('b', 'bcond') and isinstance(v.target, int) and entry <= v.target < end:
                         labels.add(v.target)
+        hooks_here = [a for a in range(entry, end, 4) if a in HOOKS]
+        if hooks_here:  # (a hook's jump targets need their labels)
+            labels = set(labels)
+            for a in hooks_here:
+                for t in HOOKS[a][1]:
+                    if not entry <= t < end:
+                        raise ValueError(f'hook {a:#x}: target {t:#x} is outside its function')
+                    labels.add(t)
         last = None
         for a in range(entry, end, 4):
             ins = self.lift(a)
@@ -403,6 +411,18 @@ class Module:
                     out.append(f'    {"if" if first else "else if"} (rw == {hx(w)}) {{ ' + ' '.join(self.render_single(v, a, jump, refs)) + ' }')
                     first = False
                 out.append('    else { ' + ' '.join(self.render_single(ins, a, jump, refs)) + ' } }')
+                last = 'op'
+                continue
+            if a in HOOKS:  # hook site (tools/patches.py HOOKS): the runtime decides, the instruction stays as it is
+                flush()
+                word, targets, _ = HOOKS[a]
+                w = struct.unpack_from('<I', self.nso.image, a - self.base)[0]
+                if w != word:
+                    raise ValueError(f'hook {a:#x}: instruction {w:#010x}, expected {word:#010x}')
+                body = ' '.join(self.render_single(ins, a, jump, refs))
+                jumps = ' '.join(f'else if (h_ == {k + 2}) goto L_{t:x};' for k, t in enumerate(targets))
+                out.append(f'    {{ int h_ = rt_hook(c, {hx(a)}); if (h_ == 0) {{ {body} }} {jumps} }}'
+                           f'  /* {a:#x}: hook (runtime/hle/hooks.c) */')
                 last = 'op'
                 continue
             if a in PATCHES:  # hand-written replacement for one instruction (tools/patches.py)
@@ -466,7 +486,9 @@ class Module:
         return out
 
 
-from patches import PATCHES
+# tools/patches.py, for the main module only (its sites are main addresses): loaded in main() once the game version
+# is known from the NSO's build ID (tools/game_addresses.py; an unknown build ID stops the generator)
+HOOKS, PATCHES = {}, {}
 
 import json as _json
 import os as _os
@@ -506,6 +528,17 @@ def main():
 
     t0 = time.time()
     m = Module(args.name, args.nso, args.base, args.simd)
+    if args.name == 'main':
+        global HOOKS, PATCHES
+        import game_addresses
+        try:
+            version = game_addresses.select_build_id(m.nso.build_id)
+        except game_addresses.UnknownGameVersion as e:
+            sys.exit(f'{args.name}: {e}')
+        import patches
+        HOOKS, PATCHES = patches.HOOKS, patches.PATCHES
+        label, build_id = game_addresses.VERSIONS[version]
+        print(f'{args.name}: game version {label} (build {build_id[:16]}), address table {version}', file=sys.stderr)
     starts = m.boundaries()
     hle = {}
     if args.hle and os.path.exists(args.hle):
@@ -623,6 +656,8 @@ def main():
         f.write('};\n')
         f.write(f'const uint64_t {args.name}_fn_count = {len(order)};\n')
         write_if_changed(os.path.join(args.outdir, f'{args.name}_table.c'), f.getvalue())
+    if args.name == 'main':  # (what this code was generated from: the Makefile's game code library id, GAMELIB_BUILD_ID)
+        write_if_changed(os.path.join(args.outdir, 'main_build_id.txt'), game_addresses.VERSIONS[version][1] + '\n')
     print(f'{args.name}: wrote {nchunks} chunks, {time.time() - t0:.0f}s total', file=sys.stderr)
 
 

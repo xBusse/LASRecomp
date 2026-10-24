@@ -1,6 +1,7 @@
-// Gameplay tab (was Difficulty): damage taken multiplier / one-hit KO (applied where the game computes Link's damage, see
-// tools/patches.py DAMAGE_*_SITES); rt_hero_mode() reads the game's own Hero Mode flag (PlayerStatus+0x120 = save
+// Gameplay tab (was Difficulty): walk speed (runtime/hle/qol.c rt_walk_speed), damage taken multiplier / one-hit KO
+// (applied where the game computes Link's damage, see tools/patches.py DAMAGE_*_SITES); rt_hero_mode() reads the game's own Hero Mode flag (PlayerStatus+0x120 = save
 // 0x55E0). Settings persist in larecomp.ini (g_settings.diff_*).
+#include "../game_addresses.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -15,10 +16,11 @@ extern "C" {
 int game_in_play(void);
 int rt_hookshot_seed_forced(void);  // hle/hookshot.c
 int rt_no_buff_seed_forced(void);   // hle/qol.c
+#include "../livesplit.h"
 }
 
-#define LIVE_SAVE 0x7001CBB220ull
-#define HERO_FLAG (LIVE_SAVE + 0x55E0)  // PlayerStatus (save+0x54C0) + 0x120
+
+#define HERO_FLAG (GA(LIVE_SAVE) + 0x55E0)  // PlayerStatus (save+0x54C0) + 0x120
 
 extern "C" int rt_hero_mode(void) { return *(volatile uint8_t *)(uintptr_t)HERO_FLAG == 1; }
 
@@ -51,6 +53,17 @@ extern "C" void difficulty_frame(void) {}
 extern "C" void difficulty_draw(float scale) {
     opt_begin("##gameplay", scale);
     opt_section("General");
+    {
+        // what the game is told the console's language is: its text follows this (runtime/settings.c)
+        char autol[64];
+        snprintf(autol, sizeof autol, "Auto (%s)", settings_language_name());
+        const char *names[N_LANGUAGES];
+        names[0] = autol;
+        for (int i = 1; i < N_LANGUAGES; i++) names[i] = g_language_names[i];
+        if (opt_choice("Language", &g_settings.language, names, N_LANGUAGES, LANG_AUTO,
+                       "The game's text language, as its own system setting. Applies when the game restarts."))
+            settings_save();
+    }
     if (rt_hookshot_seed_forced()) {  // (the seed's logic counts on it: always on, the toggle greyed out)
         bool on = true;
         opt_disable_next();
@@ -72,6 +85,22 @@ extern "C" void difficulty_draw(float scale) {
     if (opt_toggle("Mirror mode", &g_settings.mirror_mode, false,
                    "Mirrors the game world."))
         settings_save();
+    {
+        static const char *const names[] = {"Normal", "Brisk", "Running", "Sprinting", "Zoomies"};
+        static const float mult[] = {1, 1.25f, 1.5f, 1.75f, 2.5f};
+        int wi = 0;  // (the closest step to the setting)
+        for (int i = 0; i < 5; i++)
+            if (fabsf(mult[i] - g_settings.walk_speed) < fabsf(mult[wi] - g_settings.walk_speed)) wi = i;
+        if (opt_choice("Walk speed", &wi, names, 5, 0, "How fast Link walks. The Pegasus Boots and swimming are unchanged.")) {
+            g_settings.walk_speed = mult[wi];
+            settings_save();
+        }
+        opt_indent(1);
+        if (wi == 0) opt_disable_next();
+        if (opt_toggle("Indoors", &g_settings.walk_speed_dungeons, false, "Also in houses, caves and dungeons. Off: normal speed there."))
+            settings_save();
+        opt_indent(-1);
+    }
     opt_section("Difficulty");
     static const char *const names[] = {"Half", "Default", "2x", "3x", "4x", "5x", "6x", "7x", "8x"};
     static const float mult[] = {0.5f, 1, 2, 3, 4, 5, 6, 7, 8};
@@ -85,5 +114,42 @@ extern "C" void difficulty_draw(float scale) {
     }
     if (opt_toggle("One-hit KO", &g_settings.diff_ohko, false, "Any hit defeats Link, whatever his hearts."))
         settings_save();
+
+    // run timer / LiveSplit (runtime/hle/run_timer.c, runtime/livesplit.c, runtime/ui/race_overlay.mm)
+    opt_section("Speedrun");
+    // (set before a save is loaded: free on the start screen, the title and the file select; locked while a file is
+    // in play - game_in_play: Link exists in a level - and free again back at the title)
+    bool locked = game_in_play();
+    if (locked) opt_disable_next();
+    if (opt_toggle("Timer", &g_settings.timer, false,
+                   locked ? "Set before starting a save."
+                          : "A run timer in the corner: real time from the start of gameplay to the ending."))
+        settings_save();
+    opt_indent(1);
+    {  // (any time, also mid-session)
+        static const char *const pos[] = {"Bottom left", "Bottom right"};
+        if (!g_settings.timer) opt_disable_next();
+        if (opt_choice("Timer position", &g_settings.timer_pos, pos, 2, TIMER_POS_LEFT, "Which corner the timer sits in."))
+            settings_save();
+    }
+    opt_indent(-1);
+    if (opt_toggle("LiveSplit", &g_settings.livesplit, false,
+                   "Drives LiveSplit through its Server component: the start, a split for each instrument and the "
+                   "ending, and game time without loading.")) {
+        settings_save();
+        livesplit_poke();
+    }
+    opt_indent(1);
+    {
+        char d[160];
+        snprintf(d, sizeof d, "Where LiveSplit's Server listens: host:port.%s",
+                 !g_settings.livesplit ? "" : livesplit_connected() ? "\n\nConnected." : "\n\nNot connected.");
+        if (!g_settings.livesplit) opt_disable_next();
+        if (opt_text("Server", g_settings.livesplit_host, sizeof g_settings.livesplit_host, "localhost:16834", d)) {
+            if (!g_settings.livesplit_host[0]) snprintf(g_settings.livesplit_host, sizeof g_settings.livesplit_host, "localhost:16834");
+            settings_save();
+        }
+    }
+    opt_indent(-1);
     opt_end();
 }

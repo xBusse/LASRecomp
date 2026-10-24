@@ -1,6 +1,7 @@
 // Quality-of-life options re-implemented from community GameBanana mods (credits in README.md; none of their files
 // are used): 360-degree movement and blur removal ("360 Controls (And More!)"). Button prompts are
 // runtime/nvn/texpatch.c, the Hero Mode icon is hidden there too.
+#include "../game_addresses.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,13 +31,40 @@ int rt_snap_dir(Cpu *c) {
         static Cpu tmp;
         tmp = *c;
         inner = true;
-        dispatch_lookup(0x7000ded9f0)(&tmp);
+        dispatch_lookup(GA(SNAP_DIR_SITE))(&tmp);
         inner = false;
         LOG("[qol] snap (%.3f, %.3f): 8-way %#x, 360 %#x (%s)\n", x, y, (uint32_t)tmp.x[0], a, on ? "360" : "8-way");
     }
     if (!on) return 0;
     c->x[0] = a;
     return 1;
+}
+
+// Walk speed (Gameplay tab, setting walk_speed): tools/patches.py WALK_SPEED_SITES hand over the multiplier Link's walk
+// / shield-walk state applies to its ramped speed (1, or 1.15 with a Piece of Power; s0) with the player actor.
+float rt_walk_speed(uint64_t player, float m, int site) {
+    static float env = -1;  // LARECOMP_WALK_SPEED=<mult>: test override; LARECOMP_LOG_WALK: log some calls
+    static int logn = -1;
+    static long mask = -1;  // LARECOMP_WALK_SITES=<bitmask>: (test) which sites scale (bits 30 / 31: animations)
+    if (env < 0) {
+        const char *e = getenv("LARECOMP_WALK_SPEED");
+        env = e ? (float)atof(e) : 0;
+        logn = ENV("LARECOMP_LOG_WALK") ? 0 : -1;
+        e = getenv("LARECOMP_WALK_SITES");
+        mask = e ? strtol(e, NULL, 0) : -1;
+    }
+    float k = env > 0 ? env : g_settings.walk_speed;
+    if (!(k > 0.5f && k <= 4)) k = 1;
+    if (k != 1 && !g_settings.walk_speed_dungeons) {  // (off indoors: every level but the overworld, "Field")
+        uint64_t ps = LD64(GA(PLAYER_STATUS_PTR));
+        if (ps && strcmp((const char *)(uintptr_t)ps, "Field")) k = 1;
+    }
+    if (!(mask >> (site >= 100 ? 30 + site - 100 : site) & 1)) k = 1;
+    if (logn >= 0) {
+        static int cnt[102];
+        if (cnt[site]++ % 30 == 0) LOG("[qol] walk site %d #%d: %.2f x %.2f\n", site, cnt[site], m, k);
+    }
+    return m * k;
 }
 
 // No Guardian Acorns / Pieces of Power (randomizer option no-buff-drops). Enemy kills count up two bytes of PlayerStatus
@@ -150,7 +178,7 @@ int rt_buff_replace(int allow) {
     static int test = -1;
     if (test < 0) test = ENV("LARECOMP_BUFF_PRIME") ? atoi(ENV("LARECOMP_BUFF_PRIME")) : 0;
     if (test) {
-        uint64_t ps = LD64(MAIN_BASE + 0x1CC1368);  // PlayerStatus*
+        uint64_t ps = LD64(GA(PLAYER_STATUS_PTR));  // PlayerStatus*
         if (ps) ST8(ps + 0xa5, 14);
         if (test == 2) allow = 1;
         { extern uint64_t renderer_present_count(void); LOG("[qol] f%llu drop roll: buff replace %d -> %d\n", (unsigned long long)renderer_present_count(), allow, allow && !no_buff()); }
@@ -186,7 +214,8 @@ static bool apply_tilt(int removed) {  // false: not set up yet (or not the name
 }
 
 // LARECOMP_SETTING_AT="frame:key=value,..." (test): flip an in-game menu toggle at that presented frame, as the menu
-// would (move_360, blur_removal, dpad_move).
+// would (move_360, blur_removal, dpad_move: 0 / 1; Cosmetics colour rows: a palette name or #RRGGBB - tunic, hearts,
+// hair, shield, skin, leaves, grass, sand; enemy_colours: 0 / 1 / 2; screen_filter: 0-3).
 static void setting_at_tick(void) {
     static const char *spec;
     static int init;
@@ -196,16 +225,23 @@ static void setting_at_tick(void) {
     extern uint64_t renderer_present_count(void);
     uint64_t now = renderer_present_count();
     if (now == last) return;
-    char buf[512];
+    char buf[4096];  // (a long test script: many rows switched in one run)
     snprintf(buf, sizeof buf, "%s", spec);
     for (char *save = NULL, *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
         unsigned long f;
-        char key[32];
-        int v;
-        if (sscanf(tok, "%lu:%31[a-z_0-9]=%d", &f, key, &v) != 3 || f <= last || f > now) continue;
+        char key[32], val[32];
+        if (sscanf(tok, "%lu:%31[a-z_0-9]=%31s", &f, key, val) != 3 || f <= last || f > now) continue;
+        int v = atoi(val);
+        if (!strcmp(key, "screen_filter")) { g_settings.screen_filter = v; LOG("[qol] test: f%llu %s = %d\n", (unsigned long long)now, key, v); }
+        if (!strcmp(key, "enemy_colours")) { g_settings.enemy_colours = v; LOG("[qol] test: f%llu %s = %d\n", (unsigned long long)now, key, v); }
         bool *b = !strcmp(key, "move_360") ? &g_settings.move_360 : !strcmp(key, "blur_removal") ? &g_settings.blur_removal :
                   !strcmp(key, "dpad_move") ? &g_settings.dpad_move : NULL;
         if (b) { *b = v != 0; LOG("[qol] test: f%llu %s = %d\n", (unsigned long long)now, key, v); }
+        CosColour *c = !strcmp(key, "tunic") ? &g_settings.tunic : !strcmp(key, "hearts") ? &g_settings.hearts :
+                       !strcmp(key, "hair") ? &g_settings.hair : !strcmp(key, "shield") ? &g_settings.shield :
+                       !strcmp(key, "skin") ? &g_settings.skin : !strcmp(key, "leaves") ? &g_settings.leaves :
+                       !strcmp(key, "grass") ? &g_settings.grass : !strcmp(key, "sand") ? &g_settings.sand : NULL;
+        if (c) { col_parse(c, val); LOG("[qol] test: f%llu %s = %s\n", (unsigned long long)now, key, val); }
     }
     last = now;
 }

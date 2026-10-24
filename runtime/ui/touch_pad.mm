@@ -185,6 +185,9 @@ extern "C" void touch_pad_set_menu_open(bool open) {
     if (g_menu_open.exchange(open) != open) input_touch_state(0, 0, 0);  // (the next touch publishes again)
 }
 
+// Whether the on-screen controller is drawn at all (the menu then renders it every frame)
+extern "C" bool touch_pad_wanted(void) { return !pad_connected(); }
+
 // Render thread, inside the ImGui frame: draw it. display: the target's size in pixels.
 extern "C" void touch_pad_draw(ImVec2 display, ImFont *font) {
     if (pad_connected()) return;  // (a controller is connected: the Home / Guide button or Back + Start open the menu)
@@ -219,5 +222,6 @@ extern "C" void touch_pad_draw(ImVec2 display, ImFont *font) {
 extern "C" bool touch_pad_event(const SDL_Event *) { return false; }
 extern "C" void touch_pad_set_menu_open(bool) {}
 extern "C" void touch_pad_draw(ImVec2, ImFont *) {}
+extern "C" bool touch_pad_wanted(void) { return false; }
 
 #endif

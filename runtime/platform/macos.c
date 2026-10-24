@@ -1,4 +1,5 @@
 // macOS host layer (runtime/platform.h).
+#include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <mach-o/dyld.h>
@@ -6,14 +7,21 @@
 #include <mach/mach_time.h>
 #include <mach/thread_policy.h>
 #include <pthread.h>
+#include <pthread/qos.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 #include <sys/ucontext.h>
 #include <fcntl.h>
+#include <sys/utsname.h>
+#include <time.h>
 #include <unistd.h>
 
+#include "../paths.h"
 #include "../platform.h"
 #if LAS_IOS
 #include <mach/vm_map.h>  // (the iOS SDK has no mach_vm.h: vm_allocate takes the same 64-bit addresses there)
@@ -21,6 +29,10 @@
 #include <crt_externs.h>
 #include <mach/mach_vm.h>
 #endif
+
+#include "posix_log.h"
+
+void rt_crash_explain(char *out, size_t n, const char *log_path);  // runtime/crash_explain.c
 
 static mach_timebase_info_data_t tb;
 
@@ -67,11 +79,63 @@ static void ios_capture_stderr(void) {
 }
 #endif
 
+// Started as the app (Finder, Dock: no terminal): stdout / stderr go to lasrecomp.log in the data folder, with five
+// backups (posix_log.h; as on Linux / Windows), and a fatal error is explained in an alert instead of the app
+// vanishing. Runs from a terminal or a test script (not the .app's executable) keep their own output.
+static char g_log_path[1024];
+
+static void log_to_file_in_app(void) {
+    char exe[1024];
+    uint32_t sz = sizeof exe;
+    if (isatty(STDERR_FILENO) || _NSGetExecutablePath(exe, &sz) != 0 || !strstr(exe, ".app/Contents/MacOS/")) return;
+    char dir[900];
+    if (!rt_data_root_early(dir, sizeof dir)) return;  // (runtime/paths.h: the data folder, wherever it was moved)
+    mkdir(dir, 0755);
+    session_log_open(dir, g_log_path, sizeof g_log_path);
+}
+
+static void sysctl_str(const char *name, char *out, size_t n) {
+    size_t len = n;
+    if (sysctlbyname(name, out, &len, NULL, 0) != 0) out[0] = 0;
+    else out[n - 1] = 0;
+}
+static int64_t sysctl_int(const char *name) {
+    int64_t v = 0;  // (hw.memsize is 64-bit, the counts 32-bit: little-endian, so either fits)
+    size_t len = sizeof v;
+    return sysctlbyname(name, &v, &len, NULL, 0) == 0 ? v : 0;
+}
+
+void plat_system_info(PlatSysInfo *si) {
+    char ver[32], machine[32] = "";
+    sysctl_str("kern.osproductversion", ver, sizeof ver);
+    struct utsname u;
+    if (uname(&u) == 0) snprintf(machine, sizeof machine, "%s", u.machine);
+    bool rosetta = sysctl_int("sysctl.proc_translated") == 1;
+#if LAS_IOS
+    snprintf(si->os, sizeof si->os, "iOS %s (%s)", ver[0] ? ver : "?", machine);
+#else
+    snprintf(si->os, sizeof si->os, "macOS %s (%s%s)", ver[0] ? ver : "?", machine, rosetta ? ", Rosetta" : "");
+#endif
+    (void)rosetta;
+    sysctl_str("machdep.cpu.brand_string", si->cpu, sizeof si->cpu);
+    si->cores = (int)sysctl_int("hw.physicalcpu");
+    si->threads = (int)sysctl_int("hw.logicalcpu");
+    int64_t p = sysctl_int("hw.perflevel0.physicalcpu"), e = sysctl_int("hw.perflevel1.physicalcpu");
+    if (p && e) snprintf(si->cores_detail, sizeof si->cores_detail, "%dP + %dE", (int)p, (int)e);
+    si->ram = (uint64_t)sysctl_int("hw.memsize");
+    char exe[1024];
+    uint32_t sz = sizeof exe;
+    si->package = _NSGetExecutablePath(exe, &sz) == 0 && strstr(exe, ".app/Contents/MacOS/") ? ".app" : NULL;
+}
+
+
 void plat_init(void) {
 #if LAS_IOS
     signal(SIGPIPE, SIG_IGN);  // (a closed log pipe or socket must not end the app)
     ios_capture_stderr();
 #endif
+    log_to_file_in_app();  // (the .app's own log on a Mac; an iOS app's executable path isn't in Contents/MacOS: no-op)
+    raise_open_file_limit();
 }
 
 // iOS: only dirty pages count against the app's memory limit (jetsam), not the 12.5 GB claimed here; the window needs
@@ -119,6 +183,11 @@ uint64_t plat_now_ns(void) {
     return mach_absolute_time() * tb.numer / tb.denom;
 }
 
+uint64_t plat_thread_cpu_ns(void) {
+    struct timespec ts;
+    return clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0 ? (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec : 0;
+}
+
 void plat_sleep_until_ns(uint64_t t) {
     if (!tb.denom) mach_timebase_info(&tb);
     mach_wait_until(t * tb.denom / tb.numer);
@@ -135,8 +204,34 @@ void plat_thread_realtime(uint64_t period_ns) {
         .constraint = (uint32_t)(period / 4),
         .preemptible = 1,
     };
-    thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&pol,
-                      THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    kern_return_t kr = thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&pol,
+                                         THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    if (kr != KERN_SUCCESS) fprintf(stderr, "[plat] real-time thread policy refused: %d\n", (int)kr);
+}
+// After a late wait: is the time-constraint policy still in effect for this thread? The kernel drops it (back to
+// timeshare, timers coalesced to ~100 ms when the app isn't frontmost) for a thread that overruns its computation
+// budget; set again when found gone. Called only on the late path: no cost otherwise.
+int plat_thread_realtime_check(uint64_t period_ns) {
+    thread_time_constraint_policy_data_t pol;
+    mach_msg_type_number_t count = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+    boolean_t def = FALSE;
+    kern_return_t kr = thread_policy_get(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&pol, &count, &def);
+    if (kr != KERN_SUCCESS) return -1;
+    if (!def) return 0;
+    plat_thread_realtime(period_ns);
+    return 1;
+}
+
+// Guest threads start at the default QoS, and on a Mac with efficiency cores (an M1 Air: 4 + 4) the scheduler may run
+// the game's frame-critical threads there - the main thread (priority 44) builds and submits every frame. Priorities
+// 44 and more urgent get user-interactive (performance cores first), the rest user-initiated. LARECOMP_THREAD_QOS=0:
+// the default class as before.
+int plat_cpu_count(void) { return 0; }  // (no affinity masks here: the caller uses the machine's count)
+
+void plat_thread_guest(int prio) {
+    static int on = -1;
+    if (on < 0) on = !getenv("LARECOMP_THREAD_QOS") || atoi(getenv("LARECOMP_THREAD_QOS")) != 0;
+    if (on) pthread_set_qos_class_self_np(prio <= 44 ? QOS_CLASS_USER_INTERACTIVE : QOS_CLASS_USER_INITIATED, 0);
 }
 
 bool plat_exe_path(char *buf, size_t size) {
@@ -161,11 +256,48 @@ const char *plat_symbol(uint64_t pc, uint64_t *offset) {
     return di.dli_sname;
 }
 
-void plat_fatal_notice(void) {  // (the log / terminal shows it)
-#if LAS_IOS
-    usleep(500000);  // (the log pump thread is still copying the report out of the pipe)
-#endif
+bool plat_module_name(uint64_t pc, char *out, size_t n) {
+    Dl_info di = {0};
+    if (!dladdr((void *)(uintptr_t)pc, &di) || !di.dli_fname) return false;
+    snprintf(out, n, "%s", di.dli_fname);
+    return true;
 }
+
+// Fatal error: what happened in plain words (runtime/crash_explain.c) - an alert when running as the app (the
+// terminal shows the log otherwise). CFUserNotification: safe from any thread, no run loop needed.
+#if LAS_IOS
+void plat_fatal_notice(void) {  // (the log shows it)
+    usleep(500000);  // (the log pump thread is still copying the report out of the pipe)
+}
+void plat_notice(const char *text) { (void)text; }  // (no alert boxes: the log has it)
+#else
+void plat_fatal_notice(void) {
+    char text[1600];
+    rt_crash_explain(text, sizeof text, g_log_path);
+    if (!g_log_path[0]) return;
+    fflush(stderr);
+    CFStringRef msg = CFStringCreateWithCString(NULL, text, kCFStringEncodingUTF8);
+    CFUserNotificationDisplayAlert(0, kCFUserNotificationStopAlertLevel, NULL, NULL, NULL, CFSTR("LAS Recomp"), msg,
+                                   CFSTR("OK"), NULL, NULL, NULL);
+    if (msg) CFRelease(msg);
+}
+
+static void *notice_thread(void *text) {
+    CFStringRef msg = CFStringCreateWithCString(NULL, text, kCFStringEncodingUTF8);
+    CFUserNotificationDisplayAlert(0, kCFUserNotificationCautionAlertLevel, NULL, NULL, NULL, CFSTR("LAS Recomp"), msg,
+                                   CFSTR("OK"), NULL, NULL, NULL);
+    if (msg) CFRelease(msg);
+    free(text);
+    return NULL;
+}
+void plat_notice(const char *text) {
+    if (!g_log_path[0]) return;
+    pthread_t t;
+    char *copy = strdup(text);
+    if (copy && !pthread_create(&t, NULL, notice_thread, copy)) pthread_detach(t);
+    else free(copy);
+}
+#endif
 
 void plat_print_backtrace(void) {
     void *bt[64];
@@ -181,6 +313,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
                                                                                // itself aborting looped, 5.7 GB log)
     uint64_t fa = (uint64_t)si->si_addr;
     uint64_t pc = uc->uc_mcontext->__ss.__pc, lr = uc->uc_mcontext->__ss.__lr;
+    { extern uint64_t g_fault_lr; g_fault_lr = lr; }
     if (rt_fault_watch(fa, pc)) return;
     char what[32];
     snprintf(what, sizeof what, "signal %d", sig);
@@ -238,11 +371,12 @@ int plat_proc_wait(PlatProc p, bool block) {
     pid_t r = waitpid((pid_t)p, &st, block ? 0 : WNOHANG);
     if (r == 0) return -1;
     if (r < 0) return 255;
-    return WIFEXITED(st) ? WEXITSTATUS(st) : 255;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : WIFSIGNALED(st) ? PLAT_PROC_SIGNALED + WTERMSIG(st) : 255;
 }
 
 static int rm_entry(const char *path, const struct stat *sb, int flag, struct FTW *ftw) {
     (void)sb, (void)flag, (void)ftw;
-    return remove(path);
+    return remove(path) == 0 || errno == ENOENT ? 0 : -1;  // (gone already: e.g. a ._ file macOS removed with its folder on exFAT)
 }
 bool plat_remove_tree(const char *dir) { return nftw(dir, rm_entry, 16, FTW_DEPTH | FTW_PHYS) == 0; }
+bool plat_onedrive_synced(const char *dir) { (void)dir; return false; }

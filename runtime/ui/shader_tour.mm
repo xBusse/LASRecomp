@@ -1,8 +1,9 @@
 // Shader preparation tour (first-launch shader compile, user 2026-10-08): LARECOMP_SHADER_TOUR=<frames per spot>
 // warps through every warp spot of the game (runtime/ui/warp_data.h), letting each scene render for a moment so
-// its shaders get translated and compiled - they land in cache/shaders/ and Metal's disk cache, which the boot
-// warm-up (runtime/nvn/renderer.m shader_cache_warm) loads every later start: no first-use pop-in. Nothing derived
-// from the game ships: the cache is built on the player's machine from their own copy. Exits when done.
+// its shaders get translated and compiled. Exits when done.
+// With LARECOMP_RECORD_KEYS=<file> (+ LARECOMP_SYNC_SHADERS=1) it records the shader variant list the first-launch
+// preparation ships (runtime/nvn/shader_prep.h, runtime/nvn/shader_variants.txt).
+#include "../game_addresses.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,7 +18,7 @@ int warp_busy(void);
 bool warp_blocked(const char *locator);
 }
 
-#define PLAYER_STATUS_PTR (MAIN_BASE + 0x1CC1368)  // PlayerStatus*: current level name at +0
+// GA(PLAYER_STATUS_PTR): PlayerStatus*: current level name at +0
 
 extern "C" void shader_tour_tick(uint64_t frame) {
     static int per = -1, i, waiting;
@@ -27,8 +28,16 @@ extern "C" void shader_tour_tick(uint64_t frame) {
     static long from = -1;  // LARECOMP_TOUR_FROM=<frame>: not before (a test script still loading a save)
     if (from < 0) { const char *e = ENV("LARECOMP_TOUR_FROM"); from = e ? atol(e) : 0; }
     if ((long)frame < from) return;
-    const int n = (int)(sizeof kWarpSpots / sizeof kWarpSpots[0]);
-    if (!started) { started = frame; LOG("[tour] %d spots, %d frames each\n", n, per); }
+    static int n = -1;  // LARECOMP_TOUR_END=<i>: up to spot i (short tours)
+    if (n < 0) {
+        n = (int)(sizeof kWarpSpots / sizeof kWarpSpots[0]);
+        if (const char *e = ENV("LARECOMP_TOUR_END")) n = atoi(e) > 0 && atoi(e) < n ? atoi(e) : n;
+    }
+    if (!started) {  // LARECOMP_TOUR_START=<i>: from spot i on (e.g. after a spot that crashed)
+        started = frame;
+        if (const char *e = ENV("LARECOMP_TOUR_START")) i = atoi(e) < n ? atoi(e) : n;
+        LOG("[tour] %d spots, %d frames each, from %d\n", n, per, i);
+    }
     if (i >= n && ENV("LARECOMP_TOUR_LOOP")) { i = 0; LOG("[tour] loop\n"); }
     if (i >= n) {
         LOG("[tour] done: %d spots in %.0f s\n", n, (frame - started) / 60.0);
@@ -59,7 +68,7 @@ extern "C" void shader_tour_tick(uint64_t frame) {
     if (applied_reset) { applied = 0; applied_reset = 0; }  // (a new spot: its own wait)
     if (warp_busy() || !game_in_play()) { applied = 0; if (frame - since <= 1800) return; }
     if (!applied) applied = frame;
-    uint64_t ps = LD64(PLAYER_STATUS_PTR);
+    uint64_t ps = LD64(GA(PLAYER_STATUS_PTR));
     bool there = ps && !strcmp((const char *)(uintptr_t)ps, w.level);
     if ((there && frame - applied >= (uint64_t)per) || frame - since > 1800) {
         if (!there) LOG("[tour] %s / %s: not reached\n", w.level, w.locator);

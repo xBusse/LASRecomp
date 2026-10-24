@@ -175,6 +175,7 @@ static bool g_skip_held;           // ex_fill: A / B held at the last look
 static double g_skip_pressed_at;    // when they were pressed (0 = not yet)
 
 static void ex_fill(Extractor *e) {
+    if (!e->fmt || !e->pkt) { e->eof = true; return; }
     if (e->skippable && !e->eof) {
         // the game skips the opening with Plus (once a save exists); A and B do too (we press Plus for it)
         extern uint64_t input_buttons_now(void);
@@ -213,21 +214,33 @@ static void ex_fill(Extractor *e) {
 static void ex_set_data_source(Cpu *c) {
     Extractor *e = self_state(c);
     const char *path = (const char *)(uintptr_t)c->x[2];
+    // Replacing a source also drops its last packet and track selection, including after a failed open.
+    if (e->pkt) av_packet_free(&e->pkt);
+    if (e->fmt) avformat_close_input(&e->fmt);
+    e->selected = 0;
+    e->ntracks = 0;
+    e->have_pkt = e->eof = e->skippable = false;
+    if (!path || !*path) { c->x[0] = 1; return; }
     // "rom:/region_common/movie/title.webm" -> extracted/romfs/region_common/movie/title.webm
     const char *rel = path && strstr(path, ":/") ? strstr(path, ":/") + 2 : path;
     char host[1024];
     snprintf(host, sizeof host, "%s/%s", g_romfs_dir, rel ? rel : "");
     LOG("[movie] open %s -> %s\n", path ? path : "(null)", host);
+    { extern void pace_hitch(const char *why);  // nvn/pace.c
+      pace_hitch("a movie"); }
     if (avformat_open_input(&e->fmt, host, NULL, NULL) < 0 || avformat_find_stream_info(e->fmt, NULL) < 0) {
         LOG("[movie] cannot open %s\n", host);
+        if (e->fmt) avformat_close_input(&e->fmt);
         c->x[0] = 1;
         return;
     }
     e->pkt = av_packet_alloc();
-    e->ntracks = 0;
+    if (!e->pkt) { avformat_close_input(&e->fmt); c->x[0] = 1; return; }
     // the opening at launch can always be skipped, vanilla and randomizer (with no save yet the game forces it)
     e->skippable = rel && strstr(rel, "movie/opening.webm");
     if (e->skippable) g_skip_pressed_at = 0;  // (a press that ended the title's attract replay isn't for this one)
+    if (rel && strstr(rel, "movie/ending.webm")) { extern void run_timer_ending_movie(void); run_timer_ending_movie(); }  // (the run's end)
+    if (rel && strstr(rel, "movie/title.webm")) { extern void run_timer_title(void); run_timer_title(); }  // (a new attempt next)
     for (unsigned i = 0; i < e->fmt->nb_streams && e->ntracks < 16; i++)
         if (e->fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO ||
             (e->fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && g_settings.movie_audio && !getenv("LARECOMP_NO_MOVIE_AUDIO")))
@@ -345,6 +358,7 @@ static void movie_track(int kind, void *p, bool add) {
 
 static void ex_dtor(Cpu *c) {
     Extractor *e = self_state(c);
+    if (e && e->pkt) av_packet_free(&e->pkt);
     if (e && e->fmt) avformat_close_input(&e->fmt);
     if (e) movie_track(0, e, false);
     c->x[0] = 0;
@@ -457,6 +471,7 @@ static void dec_signal(Cpu *c, Decoder *d, int i) {
 
 typedef struct NvnTexture NvnTexture;
 void renderer_upload_rgba(NvnTexture *t, const void *rgba, uint32_t w, uint32_t h, uint32_t stride);
+bool renderer_upload_nv12(NvnTexture *t, const void *nv12, uint32_t w, uint32_t h, uint32_t stride, uint32_t uv_off);
 
 static void dec_configure(Cpu *c) {
     Decoder *d = self_state(c);
@@ -707,6 +722,14 @@ static void dec_get_output_buffer(Cpu *c) {
         // texture output mode: the buffer points at the game's NVNtexture; write RGBA into it
         NvnTexture *t = *(NvnTexture **)(uintptr_t)b->base;
         int w = d->width, h = d->height;
+        // the GPU converts it (renderer_upload_nv12); LARECOMP_MOVIE_CPU_CONVERT=1: swscale + an RGBA upload, as before
+        static int gpu = -1;
+        if (gpu < 0) gpu = !getenv("LARECOMP_MOVIE_CPU_CONVERT");
+        if (gpu && renderer_upload_nv12(t, d->out_mem[i], (uint32_t)w, (uint32_t)h, (uint32_t)d->stride,
+                                        (uint32_t)(d->stride * ((h + 15) & ~15)))) {
+            c->x[0] = 0;
+            return;
+        }
         if (!d->sws)
             d->sws = sws_getContext(w, h, AV_PIX_FMT_NV12, w, h, AV_PIX_FMT_RGBA, SWS_BILINEAR, NULL, NULL, NULL);
         if (!d->rgba) d->rgba = malloc((size_t)w * h * 4);
@@ -739,20 +762,26 @@ static void dec_release_output(Cpu *c) {
     c->x[0] = 0;
 }
 
-static void dec_dtor(Cpu *c) {
-    Decoder *d = self_state(c);
-    if (!d) { c->x[0] = 0; return; }
-    dec_stop(c);
-    pthread_mutex_lock(&d->lock);
+// Both destruction and a reboot release the host allocations. The HLE input/output buffers are separate:
+// destruction returns them to the pool; a reboot discards the whole HLE heap after guest threads have stopped.
+static void dec_free(Decoder *d) {
     if (d->ctx) avcodec_free_context(&d->ctx);
-    for (int i = 0; i < NIN; i++) buf_put(d->in_mem[i], d->in_cap), d->in_mem[i] = NULL;
-    for (int i = 0; i < NOUT; i++) buf_put(d->out_mem[i], d->out_cap), d->out_mem[i] = NULL;
     for (int i = 0; i < d->npending; i++) av_frame_free(&d->pending[i]);
     d->npending = d->nready = 0;
     av_frame_free(&d->frame);
     av_packet_free(&d->pkt);
     if (d->sws) sws_freeContext(d->sws), d->sws = NULL;
     free(d->rgba), d->rgba = NULL;
+}
+
+static void dec_dtor(Cpu *c) {
+    Decoder *d = self_state(c);
+    if (!d) { c->x[0] = 0; return; }
+    dec_stop(c);
+    pthread_mutex_lock(&d->lock);
+    dec_free(d);
+    for (int i = 0; i < NIN; i++) buf_put(d->in_mem[i], d->in_cap), d->in_mem[i] = NULL;
+    for (int i = 0; i < NOUT; i++) buf_put(d->out_mem[i], d->out_cap), d->out_mem[i] = NULL;
     pthread_mutex_unlock(&d->lock);
     movie_track(1, d, false);  // (d itself stays: the game's object may still point at it)
     c->x[0] = 0;
@@ -762,9 +791,10 @@ static void dec_dtor(Cpu *c) {
 RT_ON_RESET(movie_reset) {
     for (int i = 0; i < MAX_MOVIE_OBJS; i++) {
         Extractor *e = g_movie_objs[0][i];
+        if (e && e->pkt) av_packet_free(&e->pkt);
         if (e && e->fmt) avformat_close_input(&e->fmt);
         Decoder *d = g_movie_objs[1][i];
-        if (d && d->ctx) avcodec_free_context(&d->ctx);
+        if (d) dec_free(d);
         g_movie_objs[0][i] = g_movie_objs[1][i] = NULL;
     }
     g_ex_vt = g_dec_vt = 0;

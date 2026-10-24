@@ -12,6 +12,9 @@
 #include <sys/mman.h>
 
 #include "interp_int.h"
+#ifndef INTERP_TEST
+#include "game_addresses.h"
+#endif
 #include "rt.h"
 
 #ifndef INTERP_TEST
@@ -166,19 +169,36 @@ static inline uint64_t ext64(uint64_t v, unsigned option, unsigned sh) {
 
 // Decoding of the instruction at pc (first time it runs): host replacements first, then the word itself.
 #ifndef INTERP_TEST
-static const InterpPatch *patch_sorted;
+static const InterpPatch *patch_sorted;  // the selected game version's replacements, by address
+static int patch_n;
+static const InterpHook *hook_sorted;  // and its hook sites
+static int hook_n;
+static uint16_t *hook_k0;  // per hook site: the kind its own instruction decoded to (run after rt_hook says 0)
 static int cmp_patch(const void *a, const void *b) {
     uint64_t x = ((const InterpPatch *)a)->addr, y = ((const InterpPatch *)b)->addr;
     return x < y ? -1 : x > y;
 }
+static int cmp_hook(const void *a, const void *b) {
+    uint64_t x = ((const InterpHook *)a)->addr, y = ((const InterpHook *)b)->addr;
+    return x < y ? -1 : x > y;
+}
 static const InterpPatch *find_patch(uint64_t addr) {
-    int lo = 0, hi = interp_patch_count;
+    int lo = 0, hi = patch_n;
     while (lo < hi) {
         int mid = (lo + hi) / 2;
         if (patch_sorted[mid].addr < addr) lo = mid + 1;
         else hi = mid;
     }
-    return lo < interp_patch_count && patch_sorted[lo].addr == addr ? &patch_sorted[lo] : NULL;
+    return lo < patch_n && patch_sorted[lo].addr == addr ? &patch_sorted[lo] : NULL;
+}
+static int find_hook(uint64_t addr) {
+    int lo = 0, hi = hook_n;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (hook_sorted[mid].addr < addr) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < hook_n && hook_sorted[lo].addr == addr ? lo : -1;
 }
 static const InterpRandoSite *find_rando(uint64_t addr) {
     for (int i = 0; i < interp_rando_count; i++)
@@ -204,6 +224,25 @@ static void decode_at(IMod *m, Op *op, uint64_t pc) {
         uint32_t rw = rando_word(pc);
         for (int i = 0; i < rs->nwords; i++)
             if (rs->words[i] == rw) w = rw;
+    }
+    int hi = find_hook(pc);
+    if (hi >= 0) {  // a hook site: the instruction decodes as it is, but rt_hook is asked first (L_HSITE)
+        if (w != hook_sorted[hi].word) {
+            static int warned;
+            if (warned++ < 8)
+                LOG("[interp] hook site %llx holds %08x, not %08x: the game files do not match this version's table\n",
+                    (unsigned long long)pc, w, hook_sorted[hi].word);
+            interp_decode(m, op, pc, w);
+            return;
+        }
+        Op t;
+        memset(&t, 0, sizeof t);
+        interp_decode(m, &t, pc, w);  // (on a private copy: nobody runs the plain instruction meanwhile)
+        hook_k0[hi] = t.k;
+        op->d = t.d; op->n = t.n; op->m = t.m; op->a = t.a; op->x = t.x; op->y = t.y;
+        op->imm = t.imm;
+        __atomic_store_n(&op->k, K_HSITE, __ATOMIC_RELEASE);
+        return;
     }
     interp_decode(m, op, pc, w);
 }
@@ -245,6 +284,17 @@ L_PATCH: {
     if (!t) NEXT();
     if (t == 1) RETURN();
     JUMP_PC(t);
+#else
+    return;
+#endif
+}
+L_HSITE: {
+#ifndef INTERP_TEST
+    int hi_ = find_hook(PCOF(op));
+    int h = rt_hook(c, hook_sorted[hi_].addr);
+    if (h == 0) goto *labels[hook_k0[hi_]];  // the site's own instruction (op still holds its operands)
+    if (h == 1) NEXT();                      // the hook did it all
+    JUMP_PC(hook_sorted[hi_].targets[h - 2]);
 #else
     return;
 #endif
@@ -554,10 +604,22 @@ L_STLR: {
 
 #ifndef INTERP_TEST
 void interp_init(void) {
-    if (!g_nmods) {
-        patch_sorted = malloc(sizeof(InterpPatch) * (size_t)(interp_patch_count + 1));
-        memcpy((void *)patch_sorted, interp_patches, sizeof(InterpPatch) * (size_t)interp_patch_count);
-        qsort((void *)patch_sorted, (size_t)interp_patch_count, sizeof(InterpPatch), cmp_patch);
+    if (!g_nmods) {  // (first call; a reboot keeps the same game)
+        const GameVersion *gv = game_version();
+        const InterpVersion *iv = NULL;
+        for (int i = 0; gv && i < interp_version_count; i++)
+            if (!strcmp(interp_versions[i].key, gv->key)) iv = &interp_versions[i];
+        if (!iv) FATAL("interp: no patch table for this game version (%s)\n", gv ? gv->key : "unknown");
+        patch_n = iv->npatches;
+        patch_sorted = malloc(sizeof(InterpPatch) * (size_t)(patch_n + 1));
+        memcpy((void *)patch_sorted, iv->patches, sizeof(InterpPatch) * (size_t)patch_n);
+        qsort((void *)patch_sorted, (size_t)patch_n, sizeof(InterpPatch), cmp_patch);
+        hook_n = iv->nhooks;
+        hook_sorted = malloc(sizeof(InterpHook) * (size_t)(hook_n + 1));
+        memcpy((void *)hook_sorted, iv->hooks, sizeof(InterpHook) * (size_t)hook_n);
+        qsort((void *)hook_sorted, (size_t)hook_n, sizeof(InterpHook), cmp_hook);
+        hook_k0 = calloc((size_t)hook_n + 1, sizeof *hook_k0);
+        LOG("[interp] game version %s: %d replacements, %d hook sites\n", iv->key, patch_n, hook_n);
     }
     for (int i = 0; i < g_nmodules; i++) {
         Module *mod = &g_modules[i];

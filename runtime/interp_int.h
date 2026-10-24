@@ -23,7 +23,7 @@ _Static_assert(sizeof(Op) == 16, "Op");
 
 // op list: UNDEF must be first (k == 0)
 #define INTERP_OPS(X) \
-    X(UNDEF) X(UDF) X(NOP) X(SIMD) X(HOOK) X(PATCH) \
+    X(UNDEF) X(UDF) X(NOP) X(SIMD) X(HOOK) X(PATCH) X(HSITE) \
     X(MOVI) X(MOVK64) X(MOVK32) \
     X(ADDI64) X(ADDI32) X(ADDSI64) X(ADDSI32) X(SUBSI64) X(SUBSI32) \
     X(ANDI64) X(ANDI32) X(ORRI64) X(ORRI32) X(EORI64) X(EORI32) X(ANDSI64) X(ANDSI32) \

@@ -1107,16 +1107,15 @@ doors:
   outer_extra: null
   door_req: null
   exit_req: null
-  inside:
+  inside:  # (paid inside; a paid ride always starts at the dock outside the vanilla door: entrance_logic.raft_shop_to_dock)
   - location: rapids-race-45
-    cond: null
   - location: rapids-race-35
     cond: hookshot
   - location: rapids-race-30
     cond: hookshot
   confidence: medium
   notes: Raft shop (NpcRaftShopMan; LAS patches RaftShopMan.bfevfl for the race prizes). The race itself runs on the overworld rapids starting outside this hut, so LADXR only shuffles it in "insanity" mode.
-    Shuffling it likely needs event fixes.
+    A shuffled exit would leave the paid ride behind (#263), so when the exit is shuffled, paying ends with a jump to the vanilla doorstep (entrance_logic.raft_shop_to_dock); the race needs nothing but the shop then.
 - id: woods-north-cave
   field_room: Field_05C
   zone_index: 0
@@ -2537,15 +2536,19 @@ doors:
     transition: DungeonOut
   ladxr: animal_cave
   type: single
-  outer_region: desert
+  outer_region: animal-village
   outer_extra: null
-  door_req: bombs
+  door_req: break-bush & bombs
   exit_req: null
   inside:
   - location: animal-village-cave
     cond: (hookshot & feather) | rooster
   confidence: high
-  notes: Bombable wall (LADXR BOMB, exit free). LAS desert = animal-village & break-bush.
+  notes: Bombable wall (LADXR BOMB, exit free) in the village's north-east corner, on the village side of the cliff
+    (Field_13N, no Walrus on the way; the Walrus sleeps on the beach, Field_16N). One room, one exit - a dead end,
+    no way into the desert. LADXR files it under desert (= village & bush there, its Walrus is removed); LAS has
+    animal-village-cave in region animal-village with break-bush & bombs, so outer_region animal-village and the
+    bush kept in door_req (LAS parity) - not a desert door, never Marin-gated.
 - id: desert-lanmola-cave
   field_room: Field_13P
   zone_index: 0

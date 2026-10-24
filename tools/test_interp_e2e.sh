@@ -15,7 +15,7 @@ llvm-objcopy -O binary $W/prog.elf $W/prog.bin
 TEXT=$(llvm-objdump -h $W/prog.elf | awk '$2==".text"{print $4, $3}')
 TOFF=$(printf '%x' $(( 0x$(echo $TEXT | cut -d' ' -f1) - BASE )))
 TSZ=$(echo $TEXT | cut -d' ' -f2)
-FUNCS=$(llvm-nm $W/prog.elf | awk '$2=="T" && $3 ~ /^t_/{printf "%s=%s ", $3, $1}')
+FUNCS=$(llvm-nm $W/prog.elf | awk '$2=="T" && $3 ~ /^(t_|hk_)/{printf "%s=%s ", $3, $1}')
 clang -O1 -w -mfma -march=native -Iruntime -DINTERP_E2E tools/interp_e2e/run.c runtime/interp.c runtime/interp_decode.c \
     runtime/interp_simd.c tools/interp_e2e/stubs.c -o $W/run -lm -lpthread
 $W/run $W/prog.bin ${BASE#0x} $TOFF $TSZ $FUNCS

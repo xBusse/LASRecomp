@@ -18,10 +18,15 @@ import glob
 import os
 import re
 
+import seashell_spots
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 POT_TYPES = {0x1a7: 'ObjDungeonPot', 0xeb: 'ObjHousePot'}
 SKIP_LEVEL_PREFIX = 'Panel'  # Chamber Dungeons (Dampe): rebuilt from the panel files, not real locations
+# levels whose pots Link can't reach: DogHouse is built on MadamHouse's model and carries copies of Madam MeowMeow's 4
+# pots in her half of the house, behind the wall from the dog house's own room (issue #64)
+SKIP_LEVELS = ('DogHouse',)
 
 DUNGEONS = {  # level -> (LAS location prefix, region, spoiler region)
     'Lv02BottleGrotto': ('D2', 'bottle-grotto', 'bottle-grotto'),
@@ -40,11 +45,21 @@ SPECIAL = {  # level -> (region, extra condition)
 
 # extra filler added to the pool, one per pot location (fractions of the pot count; user 2026-10-08: not only
 # rupees - what pots really drop: single hearts, single arrows, bomb / powder refills). rupee-5 = the blue rupee.
-JUNK_MIX = [('rupee-5', 0.26), ('rupee-20', 0.12), ('rupee-50', 0.05), ('rupee-100', 0.03),
+JUNK_MIX = [('pot-rupee-5', 0.26), ('pot-rupee-20', 0.12), ('pot-rupee-50', 0.05), ('pot-rupee-100', 0.03),
             ('pot-heart', 0.22), ('pot-arrows', 0.12), ('pot-bombs', 0.12), ('pot-powder', 0.08)]
 # pot filler items (LAS item defs). Refills only work once the item is owned: placed with REFILL_INDEX, the
 # runtime (runtime/hle/keysanity.c rt_add_item) gives a blue rupee instead when the bombs / powder / bow are missing.
 FILLER_DEFS = {
+    # (own rupee items, as digs.py: LAS's trapsanity turns every rupee-20 / rupee-50 - with blupsanity every rupee-5 -
+    # into a trap, which made most pots and bushes traps)
+    'pot-rupee-5': {'item-key': 'Rupee5', 'model-path': 'ItemRupeeBlue.bfres', 'model-name': 'RupeeBlue',
+                    'npc-key': 'ItemRupeeBlue'},
+    'pot-rupee-20': {'item-key': 'Rupee20', 'model-path': 'ItemRupeeRed.bfres', 'model-name': 'RupeeRed',
+                     'npc-key': 'ItemRupeeRed'},
+    'pot-rupee-50': {'item-key': 'Rupee50', 'model-path': 'ItemRupeePurple.bfres', 'model-name': 'RupeePurple',
+                     'npc-key': 'ItemRupeePurple'},
+    'pot-rupee-100': {'item-key': 'Rupee100', 'model-path': 'ItemRupeeSilver.bfres', 'model-name': 'RupeeSilver',
+                      'npc-key': 'ItemRupeeSilver'},
     'pot-heart': {'item-key': 'Heart', 'model-path': 'ItemRecoveryHeart.bfres', 'model-name': 'RecoveryHeart',
                   'npc-key': 'ItemRecoveryHeart'},
     'pot-arrows': {'item-key': 'Arrow', 'model-path': 'ItemArrow.bfres', 'model-name': 'Arrow', 'npc-key': 'ItemArrow'},
@@ -53,6 +68,10 @@ FILLER_DEFS = {
                    'npc-key': 'ItemMagicPowder'},
 }
 REFILLS = ('pot-arrows', 'pot-bombs', 'pot-powder')
+# rooms Link may never (again) reach: Eagle's Tower's 3rd floor exists twice - before the ceiling collapse (the ball
+# breaking the 4 pillars) and after it; each version's pots are their own (its chests share their flags: safe).
+# Their pots aren't checks at all (vanilla contents, no gold): a check there could be lost for good (user 2026-10-18)
+MISSABLE_ROOMS = ('Lv07EagleTower_02E', 'Lv07EagleTower_06E')
 REFILL_INDEX = 80
 QUICK = ('pot-heart',) + REFILLS  # picked up like rupees: no item-get animation
 # traps among the pot filler, by LAS's trap setting (fraction of the pot count; never the Zol trap - it needs a chest)
@@ -71,16 +90,19 @@ def scan(romfs, leb):
     pots = []
     for f in sorted(glob.glob(os.path.join(romfs, 'region_common', 'level', '*', '*.leb'))):
         level = os.path.basename(os.path.dirname(f))
-        if level.startswith(SKIP_LEVEL_PREFIX):
+        if level.startswith(SKIP_LEVEL_PREFIX) or level in SKIP_LEVELS:
             continue
         room_name = os.path.basename(f)[:-4]
+        if room_name in MISSABLE_ROOMS:
+            continue
         with open(f, 'rb') as fh:
             room = leb.Room(fh.read())
         n = 0
         for i, a in enumerate(room.actors):
             if a.type not in POT_TYPES:
                 continue
-            pots.append({'level': level, 'room': room_name, 'key': a.key, 'n': n})
+            # (shell: the Secret Seashell spot it hides - add_to_logic makes the spot this pot's check)
+            pots.append({'level': level, 'room': room_name, 'key': a.key, 'n': n, 'shell': seashell_spots.shell_index(a)})
             n += 1
     return pots
 
@@ -103,7 +125,8 @@ def _door_logic(entrance_data):
 
 def add_to_logic(pots, logic_defs, item_defs, entrance_data, traps='none', rng=None):
     """Adds a location per pot to LAS's logic and matching filler to the pool (JUNK_MIX, traps by the seed's
-    trap setting). Returns {location: pot}."""
+    trap setting). Returns {location: pot}. A pot holding a Secret Seashell (the Ghost House's) is that spot's check
+    (seashell_spots.absorb: the spot's LAS location goes, its seashell fills this check - no filler for it)."""
     doors = _door_logic(entrance_data)
     spoiler_of = {}
     for k, v in logic_defs.items():
@@ -114,7 +137,7 @@ def add_to_logic(pots, logic_defs, item_defs, entrance_data, traps='none', rng=N
         conds = [v.get('condition-basic') for k, v in logic_defs.items()
                  if v.get('type') == 'item' and k.startswith(prefix + '-') and v.get('condition-basic')]
         dungeon_cond[level] = _and(*sorted(set(conds)))
-    locs = {}
+    locs, absorbed = {}, 0
     skipped = set()
     for p in pots:
         lv = p['level']
@@ -131,12 +154,15 @@ def add_to_logic(pots, logic_defs, item_defs, entrance_data, traps='none', rng=N
             skipped.add(lv)
             continue
         name = location_name(p)
-        logic_defs[name] = {'type': 'item', 'subtype': 'standing', 'content': 'rupee-5', 'region': region,
-                            'spoiler-region': spoiler or 'mabe-village', 'condition-basic': cond}
+        loc = {'type': 'item', 'subtype': 'standing', 'content': 'rupee-5', 'region': region,
+               'spoiler-region': spoiler or 'mabe-village', 'condition-basic': cond}
+        if p.get('shell') is not None and seashell_spots.absorb(logic_defs, p['shell'], loc):
+            absorbed += 1
+        logic_defs[name] = loc
         locs[name] = p
     for k, d in FILLER_DEFS.items():
         item_defs.setdefault(k, dict(d, type='junk', quantity=0, **{'chest-type': 'junk'}))
-    n = len(locs)
+    n = len(locs) - absorbed
     trap_kinds = [k for k in item_defs if k.endswith('-trap') and not k.startswith('zol')]
     n_traps = int(round(n * POT_TRAPS.get(traps, 0.0))) if trap_kinds else 0
     if n_traps:
@@ -195,6 +221,19 @@ def apply(locs, mods, out_dir, romfs, leb, event_tools, oead_tools, item_get, da
     for name, p in locs.items():
         by_room.setdefault((p['level'], p['room']), []).append((name, p))
     spoiler = []
+    level_keys = {}  # level -> every actor key in its rooms (keys must be unique across a level, not just a room)
+
+    def keys_of(level):
+        if level not in level_keys:
+            ks = set()
+            names = {os.path.basename(f) for d in (common_in, common_out)
+                     for f in glob.glob(os.path.join(d, 'level', level, '*.leb'))}
+            for n in names:
+                with open(path(f'level/{level}/{n}'), 'rb') as fh:
+                    ks.update(a.key for a in leb.Room(fh.read()).actors)
+            level_keys[level] = ks
+        return level_keys[level]
+
     for (level, room_name), entries in sorted(by_room.items()):
         rel = f'level/{level}/{room_name}.leb'
         with open(path(rel), 'rb') as fh:
@@ -204,6 +243,7 @@ def apply(locs, mods, out_dir, romfs, leb, event_tools, oead_tools, item_get, da
             pot = by_key.get(p['key'])
             if pot is None:  # (its item would be lost: LAS's open-mabe once took two bushes away - bushes.scan)
                 raise RuntimeError(f'{name}: no {flag_prefix} actor {p["key"]:#x} in {room_name}')
+            seashell_spots.clear_drop(pot)  # (a Secret Seashell spot this check took over: no shell drop besides)
             if next_flag >= flag_limit:
                 raise RuntimeError(f'out of GlobalFlags indices for {flag_prefix}')
             flag = f'{flag_prefix}{next_flag}'
@@ -235,7 +275,14 @@ def apply(locs, mods, out_dir, romfs, leb, event_tools, oead_tools, item_get, da
                 sheet['values'].append({'symbol': f'{flag_prefix}Cut{cut}', 'index': cut})
                 next_flag += 1
             it = copy.deepcopy(pot)
-            it.key = (key_tag << 56) | ((p['n'] & 0xFFFF) << 32) | (pot.key & 0xFFFFFFFF)
+            # the pot's own key under our tag: actor keys are unique per LEVEL, and a key a second room of the level
+            # also uses spawns only once (issue #65: the item of the n-th pot of a room took the key of the n-th pot of
+            # every other room whose pots share the key's low 32 bits - most dungeon pots never had their item)
+            used_keys = keys_of(level)
+            it.key = (key_tag << 56) | (pot.key & 0x00FFFFFFFFFFFFFF)
+            while it.key in used_keys:
+                it.key = (key_tag << 56) | ((it.key + (1 << 32)) & 0x00FFFFFFFFFFFFFF)
+            used_keys.add(it.key)
             it.name = b'SinkingSword-%016X' % it.key
             it.type = 0x194
             it.parameters = [model_path.encode(), model_name.encode(), name.encode(), flag.encode(),

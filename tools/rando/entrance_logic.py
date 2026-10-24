@@ -33,7 +33,8 @@ def load(path=os.path.join(HERE, 'entrance_data.yml')):
 def pool(ed, closed=()):
     """closed: outer regions whose doors stay vanilla. Decoupled exits with the desert shut (open-desert off: Marin in
     the pool, the Walrus asleep) must not drop Link behind the Walrus - he couldn't walk back out, and the Marin gate
-    would be skipped - so the desert's two doors (Lanmola cave stairs, Animal Village cave wall) aren't shuffled then."""
+    would be skipped - so the desert's door (the Lanmola cave stairs) isn't shuffled then. (The Animal Village cave's
+    bombable wall is on the village side of the cliff, not behind the Walrus: an animal-village door, always pooled.)"""
     out = []
     for d in ed['doors']:
         if d['type'] != 'single' or d['id'] in KEEP or d.get('outer_region') in closed:
@@ -97,15 +98,25 @@ def apply_logic(logic, doors, entry, exit_, extra_inside=None):
             else:
                 loc.pop('condition-basic', None)
             moved += 1
+        for fo in by_id[t].get('followers') or []:  # (BowWow, the Rooster: freed inside, they follow from there)
+            loc = logic.get(fo['follower'])
+            if not loc:
+                continue
+            loc['region'] = f'inside-{t}'
+            for k in ('condition-advanced', 'condition-glitched', 'condition-hell'):
+                loc.pop(k, None)
+            loc['condition-basic'] = str(fo['cond'])
+            moved += 1
     for (loc, token), door in INSIDE_TOKENS.items():
         if loc in logic and door in by_id and f'inside-{door}' in logic:
             c = logic[loc].get('condition-basic', '')
             logic[loc]['condition-basic'] = ' '.join(f'inside-{door}' if w == token else w for w in c.split())
-    # leaving interior I through door c puts Link outside c (coupled: the door he came in by)
+    # leaving interior I through door c puts Link outside c (coupled: the door he came in by); past what blocks
+    # that doorstep (exit_req: the rock at Mamu's cave, the bushes at the Trendy Game)
     for t, c in exit_.items():
         region = by_id[c]['outer_region']
         if region in logic and f'inside-{t}' in logic:
-            _or_into(logic[region], f'inside-{t}')
+            _or_into(logic[region], _and(f'inside-{t}', by_id[c].get('exit_req')))
     return moved
 
 
@@ -130,6 +141,17 @@ POCKETS = {
     'outside-d6': ('pocket-outside-d6', None, ('river', 'flippers')),        # jump into the water
     'toadstool-clearing': ('pocket-toadstool-clearing', 'swamp & (feather | rooster)', None),  # (LADXR)
     'pothole-field': ('pothole', None, None),  # LAS region pothole = the field behind Richard's villa
+}
+# pocket name -> {Field room: tiles}: the parts of a pocket on screens beside its door's own (pocket_screens: the door's
+# screen, whole), from the walkable area the door opens on (field_reach.areas; tools/test_field_regions.py checks it).
+# A bush / dig tile there stands in the pocket too: the toadstool clearing runs north from Field_06A into the bottom of
+# Field_05A and the edge of Field_05B (bush-05A-1, 5F5HF-AB703-...: only reached through the Quadruplets' house and the
+# river behind it in that seed, while the logic had it as plain woods); the Papahl ledge runs west into Field_02J.
+POCKET_TILES = {
+    'toadstool-clearing': {'Field_05A': (52, 53, 54, 55, 56, 57, 58, 59, 62, 63, 64, 65, 66, 67, 68, 69, 72, 73, 74, 75),
+                           'Field_05B': (50, 60)},
+    'papahl-ledge': {'Field_02J': (5, 6, 10, 11, 12, 13, 14, 15, 16, 21, 24, 25, 26, 34, 35, 36, 37, 38, 39, 44, 45, 46,
+                                   54)},
 }
 # cave -> [(node, condition-basic LAS has, condition-basic without the vanilla route through that cave or None
 # for "only through shuffled cave doors")]; the node's advanced / glitched / hell conditions are dropped
@@ -183,6 +205,18 @@ def pocket_screens(cdoors):
             if g >= 0:
                 out[f'Field_{g // 16 + 1:02d}{chr(65 + g % 16)}'] = d['pocket_region']
     return out
+
+
+def pocket_of(cdoors):
+    """-> f(room, tile): the pocket region a Field tile stands in (pocket_screens + POCKET_TILES), else None."""
+    screens = pocket_screens(cdoors)
+    tiles = {}
+    for d in cdoors:
+        p = (d.get('pocket') or {}).get('name')
+        for room, ts in POCKET_TILES.get(p, {}).items():
+            for t in ts:
+                tiles[(room, t)] = d['pocket_region']
+    return lambda room, tile: tiles.get((room, tile)) or screens.get(room)
 
 
 def connector_levels(cdoors):
@@ -314,6 +348,31 @@ def _move(logic, location, region, cond):
     return 1
 
 
+def raft_shop_to_dock(exit_, out_dir, romfs, event_tools):
+    """The Rapids Ride starts at the dock outside the raft shop's vanilla door: after paying, Link walks out and boards
+    the raft there. A shuffled exit takes him somewhere else, and the paid ride is gone by the time he gets back to
+    the dock (gate shut, no raft), so the ride and the race could never start (#263). When the shop's exit is
+    shuffled, the owner's paid branch (RaftShopMan.bfevfl `talk`: pay, StartGame, ... Event9) ends with a jump to the
+    vanilla doorstep (Field_04P's own start, played as walking out of the hut), as if Link had left through the
+    vanilla door. Leaving without paying still uses the shuffled exit. Returns True when the flow was changed."""
+    if exit_.get('raft-shop', 'raft-shop') == 'raft-shop':
+        return False
+    rel = os.path.join('region_common', 'event', 'RaftShopMan.bfevfl')
+    path = os.path.join(out_dir, 'romfs', rel)
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(os.path.join(romfs, rel), 'rb') as f, open(path, 'wb') as g:
+            g.write(f.read())
+    flow = event_tools.readFlow(path)
+    fc = flow.flowchart
+    e9 = event_tools.findEvent(fc, 'Event9')  # (SetFacialExpression normal: the end of the paid branch)
+    assert e9 is not None and e9.data.nxt.v is None, 'RaftShopMan.bfevfl Event9 changed'
+    event_tools.createActionChain(fc, 'Event9', [
+        ('GameControl', 'RequestLevelJump', {'level': 'Field', 'locator': 'Field_04P', 'offsetX': 0.0, 'offsetZ': 0.0})])
+    event_tools.writeFlow(path, flow)
+    return True
+
+
 def spoiler(doors, entry, exit_):
     by_id = {d['id']: d for d in doors}
     lines = ['Entrances (door -> interior it leads into):']
@@ -353,7 +412,8 @@ def apply_rooms(doors, entry, exit_, read_room, write_room, zones_path=os.path.j
         z = next(z for z in zones if z['room'] == d['field_room'] and z['index'] == d['zone_index'])
         field[d['id']] = list(z['params'])
         if d['type'] == 'connector':  # several doors of one cave return to one screen: the zone named per door
-            rz = [d['return_zone']] + list(d.get('other_return_zones') or [])
+            rz = [d['return_zone']] + list(d.get('other_return_zones') or  # (entrance_data.yml nests them)
+                                           (d['return_zone'] or {}).get('other_return_zones') or [])
             returns[d['id']] = [(r['room'], r['index']) for r in rz]
             ret_params[d['id']] = list(next(z for z in zones if (z['room'], z['index']) == returns[d['id']][0])['params'])
             continue

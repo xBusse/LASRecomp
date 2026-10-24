@@ -277,3 +277,6 @@ uint64_t t_matmul(void) {
 uint64_t t_zbench_fib(void) { return fib(30) == 832040 ? 0 : 1; }
 uint64_t t_zbench_loop(void) { volatile uint64_t s = 0; for (uint64_t i = 0; i < 20000000; i++) s += i * 3 + (i >> 2); return s ? 0 : 1; }
 uint64_t t_zbench_matmul(void) { for (int i = 0; i < 40; i++) if (t_matmul()) return 1; return 0; }
+
+// Hook-site test (run.c): `add x0, x0, #10` is the hook site; its answer decides what the function returns.
+__asm__(".text\n.global hk_fn\nhk_fn:\n mov x0, #1\n add x0, x0, #10\n add x0, x0, #100\n ret\n");
