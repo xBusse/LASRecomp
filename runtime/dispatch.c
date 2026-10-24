@@ -67,6 +67,12 @@ void hle_override(uint64_t addr, HostFn fn, const char *name) {
 }
 
 // The replacement of the guest function at addr, if any (the interpreter decodes it into a call of it).
+const char *dispatch_hle_name(uint64_t pc) {  // the host function a fake HLE address stands for
+    if (pc < HLE_BASE || pc >= HLE_BASE + HLE_SIZE) return NULL;
+    int i = (int)((pc - HLE_BASE) / 16);
+    return i < hle_count ? hle_slots[i].name : NULL;
+}
+
 HostFn dispatch_override_lookup(uint64_t addr) {
     for (int i = 0; i < override_count; i++)
         if (overrides[i].addr == addr) return overrides[i].fn;
@@ -230,7 +236,17 @@ void rt_fatal_trace(void) {
     plat_print_backtrace();
     Cpu *c = kernel_current_cpu();
     if (c) {
-        fprintf(stderr, "guest: sp=%llx lr=%llx\n", c->sp, c->x[30]);
+        uint64_t po = 0, lo = 0;
+        const char *ps = loader_symbol_at(c->pc, &po), *ls = loader_symbol_at(c->x[30], &lo);
+        fprintf(stderr, "guest: pc(last call target)=%llx %s+%llx  sp=%llx lr=%llx %s+%llx\n", (unsigned long long)c->pc,
+                ps ? ps : "?", (unsigned long long)po, (unsigned long long)c->sp, (unsigned long long)c->x[30],
+                ls ? ls : "?", (unsigned long long)lo);
+        interp_dump_calls();
+        if (c->pc >= 0x7000000000ull && c->pc < 0x7008000000ull) {  // the instructions around the one that crashed
+            fprintf(stderr, "words@%llx:", (unsigned long long)(c->pc - 96));
+            for (int k = 0; k < 32; k++) fprintf(stderr, " %08x", *(const uint32_t *)(uintptr_t)(c->pc - 96 + 4 * (uint64_t)k));
+            fprintf(stderr, "\n");
+        }
         for (int i = 0; i < 31; i += 4)
             fprintf(stderr, "  x%-2d %016llx  x%-2d %016llx  x%-2d %016llx  x%-2d %016llx\n", i, c->x[i], i + 1,
                     c->x[i + 1], i + 2, c->x[i + 2], i + 3, c->x[i + 3]);

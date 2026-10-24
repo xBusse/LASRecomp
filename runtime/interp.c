@@ -6,6 +6,7 @@
 // library is loaded next to the interpreter) mix freely through rt_dispatch.
 #include "interp.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -51,6 +52,34 @@ static inline Op *lookup(uint64_t t, IMod **pm) {
 }
 
 static void run(Cpu *c, IMod *m, Op *op);
+
+#ifdef INTERP_TRACK  // debugging: the last calls a thread made (a crash report prints them)
+#define NCALLS 24
+static __thread uint64_t t_calls[NCALLS][2];  // {target, return address}
+static __thread unsigned t_ncalls;
+#define TRACK_CALL(t, ra) do { t_calls[t_ncalls % NCALLS][0] = (t); t_calls[t_ncalls % NCALLS][1] = (ra); t_ncalls++; } while (0)
+void interp_dump_calls(void) {
+    extern const char *dispatch_hle_name(uint64_t pc);
+    fprintf(stderr, "last guest calls (oldest first; target <- return address):\n");
+    for (unsigned i = t_ncalls > NCALLS ? t_ncalls - NCALLS : 0; i < t_ncalls; i++) {
+        uint64_t t = t_calls[i % NCALLS][0], ra = t_calls[i % NCALLS][1], off = 0, roff = 0;
+        const char *h = dispatch_hle_name(t), *s = h ? h : loader_symbol_at(t, &off), *rs = loader_symbol_at(ra, &roff);
+        fprintf(stderr, "  %llx %s+%llx  <- %llx %s+%llx\n", (unsigned long long)t, s ? s : "?", (unsigned long long)off,
+                (unsigned long long)ra, rs ? rs : "?", (unsigned long long)roff);
+    }
+    // the first words of the last few call targets (to read them with an AArch64 disassembler)
+    for (unsigned i = t_ncalls > 6 ? t_ncalls - 6 : 0; i < t_ncalls; i++) {
+        uint64_t t = t_calls[i % NCALLS][0];
+        if (t < 0x7000000000ull || t >= 0x7008000000ull) continue;
+        fprintf(stderr, "  words@%llx:", (unsigned long long)t);
+        for (int k = 0; k < 6; k++) fprintf(stderr, " %08x", *(const uint32_t *)(uintptr_t)(t + 4 * (uint64_t)k));
+        fprintf(stderr, "\n");
+    }
+}
+#else
+#define TRACK_CALL(t, ra) ((void)0)
+void interp_dump_calls(void) {}
+#endif
 
 static inline void call_pc(Cpu *c, uint64_t t) {
     IMod *m2;
@@ -104,7 +133,11 @@ static inline uint64_t ext64(uint64_t v, unsigned option, unsigned sh) {
 #define JUMP_PC(t) do { c->pc = (t); return; } while (0)
 #define TRAP_UDF() do { g_step_fail = 1; return; } while (0)
 #else
+#ifdef INTERP_TRACK  // debugging: c->pc is always the instruction being run (a crash report names it)
+#define DISPATCH() do { c->pc = PCOF(op); goto *labels[__atomic_load_n(&op->k, __ATOMIC_ACQUIRE)]; } while (0)
+#else
 #define DISPATCH() goto *labels[__atomic_load_n(&op->k, __ATOMIC_ACQUIRE)]
+#endif
 #define NEXT() do { ++op; DISPATCH(); } while (0)
 #define TAKEN() do { op += op->imm; DISPATCH(); } while (0)
 #define JUMP_PC(t) do {                                  \
@@ -125,9 +158,9 @@ static inline uint64_t ext64(uint64_t v, unsigned option, unsigned sh) {
 #define CALL_REG() do { uint64_t t_ = N; R(30) = PCOF(op) + 4; c->pc = t_; return; } while (0)
 #define RETURN() do { c->pc = R(30); return; } while (0)
 #else
-#define CALL_NEAR() do { R(30) = PCOF(op) + 4; run(c, m, op + op->imm); NEXT(); } while (0)
-#define CALL_FAR() do { R(30) = PCOF(op) + 4; c->pc = (uint64_t)op->imm; rt_dispatch(c); NEXT(); } while (0)
-#define CALL_REG() do { uint64_t t_ = N; R(30) = PCOF(op) + 4; call_pc(c, t_); NEXT(); } while (0)
+#define CALL_NEAR() do { R(30) = PCOF(op) + 4; c->pc = PCOF(op + op->imm); TRACK_CALL(c->pc, R(30)); run(c, m, op + op->imm); NEXT(); } while (0)  // (c->pc: the callee, for crash reports)
+#define CALL_FAR() do { R(30) = PCOF(op) + 4; c->pc = (uint64_t)op->imm; TRACK_CALL(c->pc, R(30)); rt_dispatch(c); NEXT(); } while (0)
+#define CALL_REG() do { uint64_t t_ = N; R(30) = PCOF(op) + 4; c->pc = t_; TRACK_CALL(t_, R(30)); call_pc(c, t_); NEXT(); } while (0)
 #define RETURN() return
 #endif
 

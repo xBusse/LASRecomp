@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/ucontext.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include "../platform.h"
@@ -23,9 +24,53 @@
 
 static mach_timebase_info_data_t tb;
 
+#if LAS_IOS
+#include <os/log.h>
+// An iPhone app's stderr goes nowhere. Everything the runtime prints (and a crash's backtrace) is taken from a pipe
+// by a thread that writes it to Documents/lasrecomp.log (visible in Files > LAS Recomp) and to the system log
+// (Console app on a Mac, process LASRecomp).
+static int g_log_fd = -1;
+static void *log_pump(void *arg) {
+    int rfd = (int)(intptr_t)arg;
+    char buf[2048], line[2200];
+    size_t n = 0;
+    for (;;) {
+        ssize_t r = read(rfd, buf, sizeof buf);
+        if (r <= 0) break;
+        if (g_log_fd >= 0) (void)!write(g_log_fd, buf, (size_t)r);
+        for (ssize_t i = 0; i < r; i++) {
+            if (buf[i] == '\n' || n == sizeof line - 1) {
+                line[n] = 0;
+                if (n) os_log_error(OS_LOG_DEFAULT, "%{public}s", line);
+                n = 0;
+            } else {
+                line[n++] = buf[i];
+            }
+        }
+    }
+    return NULL;
+}
+static void ios_capture_stderr(void) {
+    const char *home = getenv("HOME");
+    char lp[1100];
+    snprintf(lp, sizeof lp, "%s/Documents/lasrecomp.log", home && *home ? home : "/tmp");
+    g_log_fd = open(lp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int p[2];
+    if (pipe(p)) return;
+    dup2(p[1], STDERR_FILENO);
+    dup2(p[1], STDOUT_FILENO);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    pthread_t t;
+    pthread_create(&t, NULL, log_pump, (void *)(intptr_t)p[0]);
+    pthread_detach(t);
+    fprintf(stderr, "[ios] log started (file %s, fd %d)\n", lp, g_log_fd);
+}
+#endif
+
 void plat_init(void) {
 #if LAS_IOS
     signal(SIGPIPE, SIG_IGN);  // (a closed log pipe or socket must not end the app)
+    ios_capture_stderr();
 #endif
 }
 
@@ -116,7 +161,11 @@ const char *plat_symbol(uint64_t pc, uint64_t *offset) {
     return di.dli_sname;
 }
 
-void plat_fatal_notice(void) {}  // (the log / terminal shows it)
+void plat_fatal_notice(void) {  // (the log / terminal shows it)
+#if LAS_IOS
+    usleep(500000);  // (the log pump thread is still copying the report out of the pipe)
+#endif
+}
 
 void plat_print_backtrace(void) {
     void *bt[64];

@@ -28,6 +28,8 @@ void interp_enter(Cpu *c);
 void interp_invalidate(uint64_t addr);
 // The randomizer seed changed: forget the instructions at its patch sites.
 void interp_reset_rando(void);
+// Debug builds (INTERP_TRACK): prints the calling thread's last guest calls to stderr.
+void interp_dump_calls(void);
 
 // Replacement of one instruction: runs instead of it; returns 0 to go on with the next one, or the guest address to
 // continue at.

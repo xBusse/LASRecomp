@@ -46,7 +46,10 @@ const Ctl CTLS[] = {
     {CENTER, -0.17f, 0.07f, 0.05f, B_MINUS, "-"}, {CENTER, 0.17f, 0.07f, 0.05f, B_PLUS, "+"},
     {CENTER, 0.0f, 0.07f, 0.05f, B_MENU, "="},
 };
-const float STICK_X = 0.30f, STICK_Y = 0.70f, STICK_R = 0.20f;  // centre from the left edge / the top, radius (heights)
+const float STICK_X = 0.38f, STICK_Y = 0.62f, STICK_R = 0.20f;  // centre from the left edge / the top, radius (heights)
+// The stick is at full tilt once the finger is this far out (a share of the radius): the thumb doesn't have to reach the
+// rim, nor go anywhere near the screen edge, to run. (A controller's stick reaches full tilt at its own, small, rim.)
+const float STICK_FULL = 0.65f, STICK_DEAD = 0.08f;
 const float HIT = 1.1f;                                         // a button's touch area against its drawn size
 
 struct Finger {
@@ -60,6 +63,11 @@ std::atomic<uint64_t> g_held{0};
 std::atomic<int> g_stick_x{0}, g_stick_y{0};  // -1000..1000, screen axes (y down)
 std::atomic<bool> g_menu_open{false};
 float g_w = 1, g_h = 1;  // the window in pixels (main thread: set from each event)
+
+// A game controller is connected: the on-screen controller hides (and stops reading fingers) until it is gone. Asked
+// every time rather than kept from the ADDED / REMOVED events: a pad already there at launch had its ADDED event before
+// this code ran. (SDL's iOS joystick list also has the accelerometer, which is not a gamepad: SDL_HasGamepad skips it.)
+bool pad_connected() { return SDL_HasGamepad(); }
 
 void ctl_xy(const Ctl &c, float w, float h, float &x, float &y) {
     x = (c.anchor == LEFT ? 0.0f : c.anchor == RIGHT ? w : w * 0.5f) + c.dx * h;
@@ -78,10 +86,10 @@ void publish() {
     for (const Finger &f : g_f) {
         if (!f.active) continue;
         if (f.on_stick) {
-            float dx = (f.x - STICK_X * u) / (STICK_R * u), dy = (f.y - STICK_Y * u) / (STICK_R * u);
+            float dx = (f.x - STICK_X * u) / (STICK_R * u * STICK_FULL), dy = (f.y - STICK_Y * u) / (STICK_R * u * STICK_FULL);
             float m = sqrtf(dx * dx + dy * dy);
             if (m > 1.0f) dx /= m, dy /= m, m = 1.0f;
-            if (m > 0.12f) sx += (int)(dx * 1000), sy += (int)(dy * 1000);  // (a small dead zone)
+            if (m > STICK_DEAD) sx += (int)(dx * 1000), sy += (int)(dy * 1000);  // (a small dead zone)
             continue;
         }
         for (const Ctl &c : CTLS) {
@@ -126,6 +134,12 @@ bool on_menu_button(float x, float y) {
 
 // Main thread. true: the event was a touch on the controller (the menu and the game don't see it).
 extern "C" bool touch_pad_event(const SDL_Event *e) {
+    static bool had_pad;
+    bool pad = pad_connected();
+    if (pad != had_pad) {  // a controller came or went: let go of every finger and button the screen was holding
+        had_pad = pad;
+        release_all();
+    }
     switch (e->type) {
     case SDL_EVENT_WINDOW_FOCUS_LOST: case SDL_EVENT_WILL_ENTER_BACKGROUND:
         release_all();  // (a finger lifted while the app wasn't looking would stay pressed)
@@ -135,6 +149,7 @@ extern "C" bool touch_pad_event(const SDL_Event *e) {
     default:
         return false;
     }
+    if (pad) return false;  // (the screen controller is hidden: touches are only the menu's own, as mouse events)
     SDL_Window *w = SDL_GetWindowFromEvent(e);
     int pw = 0, ph = 0;
     if (w) SDL_GetWindowSizeInPixels(w, &pw, &ph);
@@ -172,6 +187,7 @@ extern "C" void touch_pad_set_menu_open(bool open) {
 
 // Render thread, inside the ImGui frame: draw it. display: the target's size in pixels.
 extern "C" void touch_pad_draw(ImVec2 display, ImFont *font) {
+    if (pad_connected()) return;  // (a controller is connected: the Home / Guide button or Back + Start open the menu)
     ImDrawList *dl = ImGui::GetForegroundDrawList();
     float u = display.y;
     bool menu = g_menu_open.load();
@@ -181,7 +197,7 @@ extern "C" void touch_pad_draw(ImVec2 display, ImFont *font) {
         float R = STICK_R * u, kx = g_stick_x.load() / 1000.0f, ky = g_stick_y.load() / 1000.0f;
         dl->AddCircleFilled(c, R, IM_COL32(255, 255, 255, 28), 48);
         dl->AddCircle(c, R, IM_COL32(255, 255, 255, 90), 48, u * 0.004f);
-        dl->AddCircleFilled(ImVec2(c.x + kx * R, c.y + ky * R), R * 0.42f, IM_COL32(255, 255, 255, kx != 0 || ky != 0 ? 120 : 70), 32);
+        dl->AddCircleFilled(ImVec2(c.x + kx * R * STICK_FULL, c.y + ky * R * STICK_FULL), R * 0.42f, IM_COL32(255, 255, 255, kx != 0 || ky != 0 ? 120 : 70), 32);
     }
     for (const Ctl &k : CTLS) {
         if (menu && k.bit != B_MENU) continue;  // (with the menu up only its button stays, to close it)

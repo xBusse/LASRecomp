@@ -38,6 +38,8 @@ done
 cp docs/icon/icon_1024.png "$APP/icon.png"  # (the window icon at run time: runtime/paths.c rt_window_icon)
 cp third_party/fonts/Baloo2/Baloo2-SemiBold.ttf "$APP/"
 cp third_party/fonts/Baloo2/OFL.txt "$APP/Baloo2-OFL.txt"
+cp third_party/fonts/DejaVu/DejaVuSans.ttf "$APP/"  # (the game's font engine needs a TrueType font with a Unicode cmap: pl.c)
+cp third_party/fonts/DejaVu/LICENSE "$APP/DejaVu-LICENSE.txt"
 
 if [ -f "$OUT/lasgame.dylib" ]; then
     cp "$OUT/lasgame.dylib" "$APP/Frameworks/lasgame.dylib"

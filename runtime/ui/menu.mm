@@ -265,6 +265,11 @@ void menu_apply_window_requests(void *win) {
     g_pixel_density = SDL_GetWindowPixelDensity(w);
     static bool text_input;
     bool want_text = capturing();
+#if LAS_IOS
+    // The system keyboard covers half the screen: only when a text field has the keys (the menu's own on-screen
+    // keyboard, osk.mm, is used otherwise), not whenever the menu is open.
+    want_text = want_text && (g_kbd.load() == 1 || (g_text_busy && !osk_is_open()));
+#endif
     if (want_text != text_input) {
         if (want_text) SDL_StartTextInput(w);
         else SDL_StopTextInput(w);
@@ -631,7 +636,8 @@ RT_ON_RESET(menu_reset) {
 static void keyboard_draw(ImGuiIO &io, float scale) {
     ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 120));
     float w = fminf(io.DisplaySize.x * 0.9f, 1100 * scale);
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * (LAS_IOS ? 0.08f : 0.5f)), ImGuiCond_Always,
+                            ImVec2(0.5f, LAS_IOS ? 0.0f : 0.5f));  // (iOS: the system keyboard covers the lower half)
     ImGui::SetNextWindowSize(ImVec2(w, 0), ImGuiCond_Always);
     ImGui::Begin("##kbd", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                                     ImGuiWindowFlags_AlwaysAutoResize);
@@ -639,7 +645,7 @@ static void keyboard_draw(ImGuiIO &io, float scale) {
     ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "Enter your name");
     ImGui::PopFont();
     static bool was_open, was_pad;
-    bool pad = g_last_pad.load(), appearing = !was_open || pad != was_pad;  // (switching device: focus the new one)
+    bool pad = !LAS_IOS && g_last_pad.load(), appearing = !was_open || pad != was_pad;  // (switching device: focus the new one)
     was_open = true, was_pad = pad;
     if (!pad) {  // keyboard: type straight into the field
         if (appearing) ImGui::SetKeyboardFocusHere();
@@ -935,6 +941,31 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     }
 
     if (kbd) keyboard_draw(io, scale);
+#if LAS_IOS
+    if (open) {  // scrolling by dragging a finger (a touch screen has no wheel): the scrollable window under the press
+        static bool tracking, scrolling;
+        static float acc_x, acc_y;
+        static ImGuiWindow *sw;
+        ImGuiContext &gc = *GImGui;
+        if (ImGui::IsMouseClicked(0)) {
+            tracking = true, scrolling = false, acc_x = acc_y = 0, sw = NULL;
+            for (ImGuiWindow *hw = gc.HoveredWindow; hw; hw = hw->ParentWindow)
+                if (hw->ScrollMax.y > 0.0f) { sw = hw; break; }
+        }
+        if (tracking && io.MouseDown[0] && sw) {
+            if (!scrolling) {  // mostly vertical, and far enough that it isn't a tap: from here on the press is a scroll
+                acc_x += io.MouseDelta.x, acc_y += io.MouseDelta.y;
+                if (fabsf(acc_y) > 12 * scale && fabsf(acc_y) > 1.5f * fabsf(acc_x)) {
+                    scrolling = true;
+                    ImGui::ClearActiveID();  // (the button / slider under the finger doesn't get the release)
+                }
+            } else {
+                ImGui::SetScrollY(sw, sw->Scroll.y - io.MouseDelta.y);
+            }
+        }
+        if (!io.MouseDown[0]) tracking = scrolling = false;
+    }
+#endif
     ImGui::Render();
     g_text_busy = open && ui_text_busy();
 #ifdef __APPLE__

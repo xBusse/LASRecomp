@@ -165,7 +165,7 @@ $(B)/rt/gamebuild.o: RTFLAGS += -DGAMELIB_ID='"$(GAMELIB_ID)"' -DGAMELIB_CFLAGS=
                                 -DGAMELIB_SHARED='"$(GAMELIB_SHARED)"'
 
 # the interpreter (runtime/interp*.c) uses the same FP / SIMD code as the generated game code
-$(B)/rt/interp.o $(B)/rt/interp_simd.o $(B)/rt/interp_decode.o $(B)/rt/interp_patches.o: RTFLAGS += $(GENARCH) -Wno-unused-label
+$(B)/rt/interp.o $(B)/rt/interp_simd.o $(B)/rt/interp_decode.o $(B)/rt/interp_patches.o: RTFLAGS += $(GENARCH) -Wno-unused-label $(if $(INTERP_TRACK),-DINTERP_TRACK)
 $(B)/rt/%.o: runtime/%.c $(RT_HDRS)
 	@mkdir -p $(dir $@)
 	$(CC) $(RTFLAGS) -c $< -o $@

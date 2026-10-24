@@ -122,9 +122,11 @@ static void load_fonts(void) {
                          "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf"};
     for (size_t i = 0; i < sizeof std / sizeof *std && !fonts[0].addr; i++)
         if (std[i]) load_one(std[i], &fonts[0]);
-    if (!fonts[0].addr) {  // iOS has no system font files to read: the start screen's own (TrueType, Latin only), until the
-        char own[1100];    // player's fonts/ (Documents/fonts, from the Files app) are there
-        if (rt_resource("Baloo2-SemiBold.ttf", "third_party/fonts/Baloo2/Baloo2-SemiBold.ttf", own, sizeof own))
+    if (!fonts[0].addr) {  // iOS has no system font files to read: a bundled TrueType font (DejaVu Sans, which the game's
+        char own[1100];    // font engine accepts: Baloo2's cmap is not enough for it), until the player's fonts/ are there
+        if (rt_resource("DejaVuSans.ttf", "third_party/fonts/DejaVu/DejaVuSans.ttf", own, sizeof own))
+            load_one(own, &fonts[0]);
+        if (!fonts[0].addr && rt_resource("Baloo2-SemiBold.ttf", "third_party/fonts/Baloo2/Baloo2-SemiBold.ttf", own, sizeof own))
             load_one(own, &fonts[0]);
     }
     if (!fonts[0].addr) FATAL("no usable system font substitute\n");
